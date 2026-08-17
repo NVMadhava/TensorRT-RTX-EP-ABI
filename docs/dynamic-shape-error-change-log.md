@@ -542,3 +542,54 @@ DequantizeLinearContribOpTest.DequantizeLinear_2
 ```
 
 The combined run contained zero `Invalid Node` and zero `No graph will run on TensorRT execution provider` messages. Detailed logging for the target showed one Myelin engine with `x (Int4[5]), x_scale (Float[]) -> y (Float[5])`, confirming TensorRT execution rather than CPU fallback.
+
+## DQ follow-up Step 4: INT4 initializer with runtime zero point
+
+Branch: `codex/dq-remaining-fixes`
+
+### Root cause
+
+`DequantizeLinearOpTest.Int4_LargeInitializerInput` has a static rank-one INT4 initializer with 1,024 elements, a runtime scalar FP32 scale, and a runtime scalar INT4 zero point. TensorRT accepts the even-length INT4 data and runtime scale, but its native DQ layer requires the third `zero_point` input to be an initializer. Engine validation therefore failed with `zero_point which is not an initializer`.
+
+The runtime zero point cannot safely be replaced by a compiled constant because its value is supplied for each execution. Directly casting INT4 to FP32 is also unavailable, as established in Step 3.
+
+### Source change
+
+The rewrite uses the exact algebraic identity:
+
+```text
+(x - zero_point) * scale == (x * scale) - (zero_point * scale)
+```
+
+It emits two native DQ paths without a zero-point input:
+
+1. `DequantizeLinear(x, scale)` computes `x * scale` for the even-length initializer.
+2. The runtime scalar INT4 zero point is reshaped to `{1}`, duplicated by Concat to `{2}`, then `DequantizeLinear(duplicated_zero, scale)` computes `zero_point * scale`. Slice retains one FP32 value.
+3. Subtract broadcasts that single FP32 value across the first result.
+
+This avoids ever presenting the runtime value as TensorRT's special DQ zero-point input. It remains a genuine runtime engine input and may vary between executions.
+
+The gate is limited to a static, rank-one, positive even-length INT4 initializer; runtime scalar FP32 scale; and runtime scalar INT4 zero point. Other shapes, types, initializer/runtime arrangements, and parameter ranks remain unchanged. A preprocessing test checks for the two DQ nodes and the Reshape/Concat/Slice/Sub structure.
+
+### Artifact and tests
+
+```text
+Artifact: C:\Users\amadhavasrir\Downloads\bulding_files\test-env\onnxruntime_providers_nv_tensorrt_rtx.dq-step4-int4-runtime-zero.dll
+SHA256: 98914EA23C371635D67BA6E01773955B8854FCF82162C7F32DFB67D867E66761
+```
+
+The target passed. Detailed logging showed one Myelin engine whose runtime signature is `x_scale (Float[]), x_zero_point (Int4[]) -> y (Float[1024])`, proving that the zero point remained a runtime input and the graph ran on TensorRT.
+
+All seven DQ tests that remained after the earlier full-suite run now pass together:
+
+```text
+DequantizeLinearOpTest.Int4_LargeInitializerInput
+DequantizeLinearOpTest.Int4NoZeroPoint
+DequantizeLinearOpTest.Without_Zero_Point
+DequantizeLinearOpTest.Per_Channel_Axis_Default
+DequantizeLinearOpTest.Per_Channel_Axis_1_int8
+DequantizeLinearContribOpTest.DequantizeLinear_1
+DequantizeLinearContribOpTest.DequantizeLinear_2
+```
+
+That focused run contained zero `Invalid Node`, zero `No graph will run on TensorRT execution provider`, and zero serialized-engine build errors. A complete batched provider-suite run is still required to establish the final global failure count.

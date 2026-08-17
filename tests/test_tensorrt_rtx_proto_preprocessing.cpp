@@ -1109,6 +1109,34 @@ TEST(TensorRTRTXProtoPreprocessingTest, OddVolumeInt4WithoutZeroPointDuplicatesA
     EXPECT_EQ(output_node->doc_string(), kOriginalDocString);
 }
 
+TEST(TensorRTRTXProtoPreprocessingTest, Int4InitializerWithRuntimeZeroPointSplitsDequantization)
+{
+    auto model = MakeModel(21);
+    auto* graph = model.mutable_graph();
+    auto* x = graph->add_initializer();
+    x->set_name("x");
+    x->set_data_type(kInt4);
+    x->add_dims(1024);
+    x->set_raw_data(std::string(512, '\0'));
+    model_builder::AddValueInfo(graph->mutable_input(), "scale", kFp32, {});
+    model_builder::AddValueInfo(graph->mutable_input(), "zero_point", kInt4, {});
+    model_builder::AddValueInfo(graph->mutable_output(), "y", kFp32, {1024});
+    auto* dq = model_builder::AddNode(graph, "dq", "DequantizeLinear", {"x", "scale", "zero_point"}, {"y"});
+    dq->set_doc_string(kOriginalDocString);
+
+    trt_rtx_ep::RunTensorRtProtoPreprocessing(model);
+
+    EXPECT_EQ(CountNodes(model.graph(), "DequantizeLinear"), 2u);
+    EXPECT_EQ(CountNodes(model.graph(), "Reshape"), 1u);
+    EXPECT_EQ(CountNodes(model.graph(), "Concat"), 1u);
+    EXPECT_EQ(CountNodes(model.graph(), "Slice"), 1u);
+    EXPECT_EQ(CountNodes(model.graph(), "Sub"), 1u);
+    const auto* output_node = FindNodeByOutput(model.graph(), "y");
+    ASSERT_NE(output_node, nullptr);
+    EXPECT_EQ(output_node->op_type(), "Sub");
+    EXPECT_EQ(output_node->doc_string(), kOriginalDocString);
+}
+
 // QuantizeLinear uses the same runtime-parameter rule. The emitted graph must
 // implement division, zero-point shift, ties-to-even rounding, saturation,
 // and the final integer cast while retaining the original output identity.

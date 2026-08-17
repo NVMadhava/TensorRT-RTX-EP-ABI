@@ -2077,6 +2077,69 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
         const int64_t block_size = FindIntAttribute(node, "block_size").value_or(0);
         const std::string node_base = !node.name().empty() ? node.name() : node.output(0);
 
+        // TensorRT requires a DQ zero-point input to be an initializer. For a
+        // static even-length INT4 vector with runtime scalar parameters, keep
+        // the zero point as ordinary quantized data instead:
+        //   DQ(x, scale) - DQ(zero_point, scale) == (x - zero_point) * scale.
+        // The scalar zero point is duplicated to two elements because native
+        // INT4 DQ also requires an even logical input volume.
+        const auto* runtime_int4_input_initializer = index.FindInitializer(node.input(0));
+        const bool can_split_runtime_int4_zero_point =
+            node.op_type() == "DequantizeLinear" && runtime_int4_input_initializer != nullptr &&
+            runtime_int4_input_initializer->data_type() == onnx::TensorProto_DataType_INT4 &&
+            runtime_int4_input_initializer->dims_size() == 1 && runtime_int4_input_initializer->dims(0) > 0 &&
+            runtime_int4_input_initializer->dims(0) % 2 == 0 && has_runtime_scalar_scale &&
+            *scale_type == onnx::TensorProto_DataType_FLOAT && has_runtime_scalar_zero_point && zero_point_type &&
+            *zero_point_type == onnx::TensorProto_DataType_INT4 && IsKnownScalarTensor(index, node.input(2));
+        if (can_split_runtime_int4_zero_point)
+        {
+            const std::string input_scaled_name = MakeLoweredName(node_base, "input_scaled", ++unique_id);
+            auto* input_dq = AppendNode(lowered_nodes, node, "DequantizeLinear",
+                                        MakeLoweredName(node_base, "input_dq", unique_id),
+                                        {node.input(0), node.input(1)}, {input_scaled_name});
+            CopyNodeAttributes(node, *input_dq);
+
+            const std::string scalar_shape_name = MakeLoweredName(node_base, "scalar_shape", ++unique_id);
+            AddInt64VectorInitializer(graph, index, scalar_shape_name, {1});
+            const std::string zero_vector_name = MakeLoweredName(node_base, "zero_vector", ++unique_id);
+            AppendNode(lowered_nodes, node, "Reshape", MakeLoweredName(node_base, "reshape_zero", unique_id),
+                       {node.input(2), scalar_shape_name}, {zero_vector_name});
+
+            const std::string duplicated_zero_name = MakeLoweredName(node_base, "duplicated_zero", ++unique_id);
+            auto* concat_zero = AppendNode(lowered_nodes, node, "Concat",
+                                           MakeLoweredName(node_base, "duplicate_zero", unique_id),
+                                           {zero_vector_name, zero_vector_name}, {duplicated_zero_name});
+            auto* concat_zero_axis = concat_zero->add_attribute();
+            concat_zero_axis->set_name("axis");
+            concat_zero_axis->set_type(onnx::AttributeProto_AttributeType_INT);
+            concat_zero_axis->set_i(0);
+
+            const std::string duplicated_zero_scaled_name =
+                MakeLoweredName(node_base, "duplicated_zero_scaled", ++unique_id);
+            auto* zero_dq = AppendNode(lowered_nodes, node, "DequantizeLinear",
+                                       MakeLoweredName(node_base, "zero_dq", unique_id),
+                                       {duplicated_zero_name, node.input(1)}, {duplicated_zero_scaled_name});
+            CopyNodeAttributes(node, *zero_dq);
+
+            const std::string starts_name = MakeLoweredName(node_base, "zero_slice_starts", ++unique_id);
+            const std::string ends_name = MakeLoweredName(node_base, "zero_slice_ends", ++unique_id);
+            const std::string axes_name = MakeLoweredName(node_base, "zero_slice_axes", ++unique_id);
+            const std::string steps_name = MakeLoweredName(node_base, "zero_slice_steps", ++unique_id);
+            AddInt64VectorInitializer(graph, index, starts_name, {0});
+            AddInt64VectorInitializer(graph, index, ends_name, {1});
+            AddInt64VectorInitializer(graph, index, axes_name, {0});
+            AddInt64VectorInitializer(graph, index, steps_name, {1});
+            const std::string zero_scaled_name = MakeLoweredName(node_base, "zero_scaled", ++unique_id);
+            AppendNode(lowered_nodes, node, "Slice", MakeLoweredName(node_base, "slice_zero", unique_id),
+                       {duplicated_zero_scaled_name, starts_name, ends_name, axes_name, steps_name},
+                       {zero_scaled_name});
+
+            AppendNode(lowered_nodes, node, "Sub", MakeLoweredName(node_base, "subtract_zero", ++unique_id),
+                       {input_scaled_name, zero_scaled_name}, {node.output(0)});
+            ++lowered_qdq_info.lowered_node_count;
+            continue;
+        }
+
         // TensorRT's native INT4 DQ importer requires an even logical input
         // volume. For the narrow rank-one, missing-zero-point form, concatenate
         // the vector with itself, dequantize the even 2N vector, then retain the
