@@ -540,6 +540,38 @@ bool ApplyProfileShapesFromProviderOptions(
                 cuda_graph_flag = false;
             }
             int shape_size = nb_dims == 0 ? 1 : static_cast<int>(profile_min_shapes[input_name][i].size());
+            {
+                std::ostringstream diag;
+                diag << "[NvTensorRTRTX EP][DynamicProfileDiag] Applying shape-tensor profile: input='"
+                     << input_name << "', profile_index=" << i << ", nb_dims=" << nb_dims
+                     << ", computed_shape_size=" << shape_size
+                     << ", min_value_count=" << profile_min_shapes[input_name][i].size()
+                     << ", opt_value_count=" << profile_opt_shapes[input_name][i].size()
+                     << ", max_value_count=" << profile_max_shapes[input_name][i].size();
+                Ort::ThrowOnError(ort_api.Logger_LogMessage(&logger, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+                                                             diag.str().c_str(), ORT_FILE, __LINE__, __FUNCTION__));
+            }
+            const auto& min_shape_values = profile_min_shapes[input_name][i];
+            const auto& opt_shape_values = profile_opt_shapes[input_name][i];
+            const auto& max_shape_values = profile_max_shapes[input_name][i];
+            const size_t required_shape_values = static_cast<size_t>(shape_size);
+
+            // A scalar shape tensor has nbDims == 0, but TensorRT still requires one
+            // profile value. Reject incomplete profiles before indexing their vectors.
+            if (min_shape_values.size() != required_shape_values ||
+                opt_shape_values.size() != required_shape_values ||
+                max_shape_values.size() != required_shape_values)
+            {
+                std::ostringstream shape_profile_error;
+                shape_profile_error << "[NvTensorRTRTX EP] Cannot apply shape-tensor optimization profile for input '"
+                                    << input_name << "': required_value_count=" << required_shape_values
+                                    << ", min_value_count=" << min_shape_values.size()
+                                    << ", opt_value_count=" << opt_shape_values.size()
+                                    << ", max_value_count=" << max_shape_values.size();
+                Ort::ThrowOnError(ort_api.Logger_LogMessage(&logger, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+                                                             shape_profile_error.str().c_str(), ORT_FILE, __LINE__, __FUNCTION__));
+                return false;
+            }
             std::vector<int64_t> shapes_min(shape_size), shapes_opt(shape_size), shapes_max(shape_size);
             shape_message = "[NvTensorRTRTX EP] shape size of this shape tensor is " + std::to_string(shape_size);
             Ort::ThrowOnError(ort_api.Logger_LogMessage(&logger, OrtLoggingLevel::ORT_LOGGING_LEVEL_VERBOSE,
@@ -547,9 +579,9 @@ bool ApplyProfileShapesFromProviderOptions(
 
             for (int j = 0; j < shape_size; j++)
             {
-                auto min_value = profile_min_shapes[input_name][i][j];
-                auto max_value = profile_max_shapes[input_name][i][j];
-                auto opt_value = profile_opt_shapes[input_name][i][j];
+                auto min_value = min_shape_values[j];
+                auto max_value = max_shape_values[j];
+                auto opt_value = opt_shape_values[j];
                 shapes_min[j] = static_cast<int64_t>(min_value);
                 shapes_max[j] = static_cast<int64_t>(max_value);
                 shapes_opt[j] = static_cast<int64_t>(opt_value);
@@ -1779,6 +1811,24 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
             const std::string& input_name = input->getName();
             nvinfer1::Dims dims = input->getDimensions();
 
+            {
+                std::ostringstream diag;
+                diag << "[NvTensorRTRTX EP][DynamicProfileDiag] Compile input: input='" << input_name
+                     << "', is_shape_tensor=" << (input->isShapeTensor() ? "true" : "false")
+                     << ", nb_dims=" << dims.nbDims << ", dims=[";
+                for (int idx_dim = 0; idx_dim < dims.nbDims; ++idx_dim)
+                {
+                    if (idx_dim > 0)
+                    {
+                        diag << ",";
+                    }
+                    diag << dims.d[idx_dim];
+                }
+                diag << "]";
+                Ort::ThrowOnError(ort_api.Logger_LogMessage(&ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+                                                            diag.str().c_str(), ORT_FILE, __LINE__, __FUNCTION__));
+            }
+
             // Apply explicit optimization profiles provided by user
             bool apply_profile = false;
             bool tensor_has_profile = profile_min_shapes_.find(input_name) != profile_min_shapes_.end() &&
@@ -1827,6 +1877,28 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
                         profile_max_shapes_[input_name][0][idx_dim] = dim_value;
                     }
                 }
+                {
+                    std::ostringstream diag;
+                    diag << "[NvTensorRTRTX EP][DynamicProfileDiag] Implicit profile constructed: input='"
+                         << input_name << "', is_shape_tensor=" << (input->isShapeTensor() ? "true" : "false")
+                         << ", value_count=" << profile_min_shapes_[input_name][0].size()
+                         << ", has_implicit_profile=" << (has_implicit_profile ? "true" : "false")
+                         << ", values(min/opt/max)=[";
+                    for (size_t idx = 0; idx < profile_min_shapes_[input_name][0].size(); ++idx)
+                    {
+                        if (idx > 0)
+                        {
+                            diag << ",";
+                        }
+                        diag << profile_min_shapes_[input_name][0][idx] << "/"
+                             << profile_opt_shapes_[input_name][0][idx] << "/"
+                             << profile_max_shapes_[input_name][0][idx];
+                    }
+                    diag << "]";
+                    Ort::ThrowOnError(ort_api.Logger_LogMessage(
+                        &ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING, diag.str().c_str(), ORT_FILE,
+                        __LINE__, __FUNCTION__));
+                }
                 apply_profile = ApplyProfileShapesFromProviderOptions(
                     trt_profiles, input, profile_min_shapes_, profile_max_shapes_, profile_opt_shapes_,
                     input_explicit_shape_ranges, cuda_graph_enable_, ep->logger_, ep->ort_api);
@@ -1846,6 +1918,16 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
             }
         }
         // Set explicit profiles in TRT config if all dynamic shape inputs have associated profiles provided by user
+        {
+            std::ostringstream diag;
+            diag << "[NvTensorRTRTX EP][DynamicProfileDiag] Final profile gate: has_dynamic_shape="
+                 << (has_dynamic_shape ? "true" : "false")
+                 << ", has_explicit_profile=" << (has_explicit_profile ? "true" : "false")
+                 << ", has_implicit_profile=" << (has_implicit_profile ? "true" : "false")
+                 << ", trt_profile_count=" << trt_profiles.size();
+            Ort::ThrowOnError(ort_api.Logger_LogMessage(&ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+                                                        diag.str().c_str(), ORT_FILE, __LINE__, __FUNCTION__));
+        }
         if (has_explicit_profile || has_implicit_profile)
         {
             // TRT EP has a constraint here.
