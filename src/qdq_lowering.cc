@@ -1444,6 +1444,75 @@ bool IsKnownScalarTensor(const GraphIndex& index, const std::string& name)
     return index.TryGetTensorShape(name, shape) && shape.empty();
 }
 
+bool IsKnownOneDimensionalTensor(const GraphIndex& index, const std::string& name)
+{
+    std::vector<int64_t> shape;
+    return index.TryGetTensorShape(name, shape) && shape.size() == 1 && shape.front() > 1;
+}
+
+struct RuntimePerAxisParameterInfo
+{
+    int64_t input_rank;
+    int64_t axis;
+    int64_t parameter_length;
+};
+
+std::optional<RuntimePerAxisParameterInfo> GetRuntimePerAxisParameterInfo(
+    const GraphIndex& index, const onnx::NodeProto& node, int64_t block_size)
+{
+    if (node.input_size() < 3 || node.input(0).empty() || node.input(1).empty() || node.input(2).empty() ||
+        block_size > 1)
+    {
+        return std::nullopt;
+    }
+
+    std::vector<int64_t> input_shape;
+    std::vector<int64_t> scale_shape;
+    std::vector<int64_t> zero_shape;
+    if (!index.TryGetTensorShape(node.input(0), input_shape) ||
+        !index.TryGetTensorShape(node.input(1), scale_shape) ||
+        !index.TryGetTensorShape(node.input(2), zero_shape) ||
+        input_shape.empty() || scale_shape.size() != 1 || zero_shape != scale_shape || scale_shape[0] <= 1)
+    {
+        return std::nullopt;
+    }
+
+    const int64_t input_rank = static_cast<int64_t>(input_shape.size());
+    int64_t axis = FindIntAttribute(node, "axis").value_or(1);
+    if (axis < 0)
+    {
+        axis += input_rank;
+    }
+    if (axis < 0 || axis >= input_rank || input_shape[static_cast<size_t>(axis)] != scale_shape[0])
+    {
+        return std::nullopt;
+    }
+
+    return RuntimePerAxisParameterInfo{input_rank, axis, scale_shape[0]};
+}
+
+void MaybeAddRuntimeAxisReshape(onnx::GraphProto& graph, GraphIndex& index,
+                                google::protobuf::RepeatedPtrField<onnx::NodeProto>& nodes,
+                                const onnx::NodeProto& source_node, const std::string& input_name,
+                                const std::string& base_name, const RuntimePerAxisParameterInfo& parameter_info,
+                                size_t unique_id, std::string& broadcast_name)
+{
+    broadcast_name = input_name;
+    if (parameter_info.axis == parameter_info.input_rank - 1)
+    {
+        return;
+    }
+
+    std::vector<int64_t> reshape_dims(static_cast<size_t>(parameter_info.input_rank), 1);
+    reshape_dims[static_cast<size_t>(parameter_info.axis)] = parameter_info.parameter_length;
+    const std::string shape_name = MakeLoweredName(base_name, "reshape_shape", unique_id);
+    const std::string reshaped_name = MakeLoweredName(base_name, "reshaped", unique_id);
+    AddInt64VectorInitializer(graph, index, shape_name, reshape_dims);
+    AppendNode(nodes, source_node, "Reshape", MakeLoweredName(base_name, "reshape", unique_id),
+               {input_name, shape_name}, {reshaped_name});
+    broadcast_name = reshaped_name;
+}
+
 // "Asymmetric" is only asymmetric if the zp tensor exists AND carries at
 // least one non-zero element. An absent zp (no input or empty-string input)
 // and a zp initializer full of zeros are both treated as symmetric (zp=0).
@@ -1943,16 +2012,19 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
         }
 
         // Gate 1: constant scales must be readable, positive, and finite.
-        // Runtime scales are accepted only for the scalar/one-element phase-1
-        // path. Their values cannot be inspected during compilation, but the
-        // ONNX contract already requires callers to supply a positive scale.
+        // Runtime scales are accepted for the scalar/one-element phase-1 path
+        // and as rank-one DQ candidates. The latter must still pass the strict
+        // per-axis shape, type, axis, and zero-point checks below.
         const auto* scale_tensor = index.FindInitializer(node.input(1));
         const auto scale_type = scale_tensor != nullptr ? std::optional<int32_t>(scale_tensor->data_type())
                                                         : index.FindTensorElementType(node.input(1));
         const bool has_runtime_scalar_scale =
             scale_tensor == nullptr && scale_type && IsKnownScalarOrOneElementTensor(index, node.input(1));
+        const bool has_runtime_per_axis_scale_candidate =
+            node.op_type() == "DequantizeLinear" && scale_tensor == nullptr && scale_type &&
+            IsKnownOneDimensionalTensor(index, node.input(1));
         if ((scale_tensor != nullptr && !IsPositiveScaleTensor(*scale_tensor)) ||
-            (scale_tensor == nullptr && !has_runtime_scalar_scale))
+            (scale_tensor == nullptr && !has_runtime_scalar_scale && !has_runtime_per_axis_scale_candidate))
         {
             *lowered_nodes.Add() = node;
             continue;
@@ -2013,7 +2085,17 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
                 IsKnownScalarTensor(index, node.input(0));
             const bool can_lower_runtime_scalar_parameters =
                 can_lower_runtime_scalar_zero_point || can_lower_runtime_scalar_without_zero_point;
-            if (!can_lower_runtime_scalar_parameters && !dequantize_decision.should_lower)
+            const auto runtime_per_axis_parameter_info =
+                scale_tensor == nullptr && zero_point_tensor == nullptr &&
+                        has_zero_point_input && *scale_type == onnx::TensorProto_DataType_FLOAT &&
+                        (*input_type == onnx::TensorProto_DataType_INT8 ||
+                         *input_type == onnx::TensorProto_DataType_UINT8) &&
+                        zero_point_type && *zero_point_type == *input_type
+                    ? GetRuntimePerAxisParameterInfo(index, node, block_size)
+                    : std::nullopt;
+            const bool can_lower_runtime_per_axis_parameters = runtime_per_axis_parameter_info.has_value();
+            if (!can_lower_runtime_scalar_parameters && !can_lower_runtime_per_axis_parameters &&
+                !dequantize_decision.should_lower)
             {
                 *lowered_nodes.Add() = node;
                 continue;
@@ -2052,6 +2134,7 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
             // before we finally cast to the floating arithmetic type used by scale.
             std::string lowered_scale_name = node.input(1);
             std::string lowered_zero_name = has_zero_point_input ? node.input(2) : std::string();
+            bool runtime_zero_is_math_type = false;
 
             if (scale_tensor != nullptr)
             {
@@ -2064,6 +2147,12 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
                     *lowered_nodes.Add() = node;
                     continue;
                 }
+            }
+            else if (can_lower_runtime_per_axis_parameters)
+            {
+                MaybeAddRuntimeAxisReshape(graph, index, lowered_nodes, node, lowered_scale_name,
+                                           MakeLoweredName(node_base, "runtime_scale", ++unique_id),
+                                           *runtime_per_axis_parameter_info, unique_id, lowered_scale_name);
             }
 
             if (zero_point_tensor != nullptr)
@@ -2089,6 +2178,25 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
                     continue;
                 }
             }
+            else if (can_lower_runtime_per_axis_parameters)
+            {
+                // TensorRT cannot reshape UINT8 tensors. Convert the runtime
+                // zero point to the floating arithmetic type first; this is
+                // also the type required by the subsequent Sub.
+                const std::string cast_zero_name = MakeLoweredName(node_base, "runtime_zero_cast", ++unique_id);
+                auto* cast_zero = AppendNode(
+                    lowered_nodes, node, "Cast", MakeLoweredName(node_base, "cast_runtime_zero", unique_id),
+                    {lowered_zero_name}, {cast_zero_name});
+                auto* cast_zero_attr = cast_zero->add_attribute();
+                cast_zero_attr->set_name("to");
+                cast_zero_attr->set_type(onnx::AttributeProto_AttributeType_INT);
+                cast_zero_attr->set_i(*arithmetic_type);
+                lowered_zero_name = cast_zero_name;
+                runtime_zero_is_math_type = true;
+                MaybeAddRuntimeAxisReshape(graph, index, lowered_nodes, node, lowered_zero_name,
+                                           MakeLoweredName(node_base, "runtime_zero", ++unique_id),
+                                           *runtime_per_axis_parameter_info, unique_id, lowered_zero_name);
+            }
 
             const auto integer_math_type = GetDequantizeIntegerMathType(*input_type);
             const int32_t input_math_type = integer_math_type.value_or(*arithmetic_type);
@@ -2105,14 +2213,18 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
             std::string dequantized_name = cast_input_name;
             if (!lowered_zero_name.empty())
             {
-                const std::string cast_zero_name = MakeLoweredName(node_base, "zero_cast", ++unique_id);
-                auto* cast_zero =
-                    AppendNode(lowered_nodes, node, "Cast", MakeLoweredName(node_base, "cast_zero", unique_id),
-                               {lowered_zero_name}, {cast_zero_name});
-                auto* cast_zero_attr = cast_zero->add_attribute();
-                cast_zero_attr->set_name("to");
-                cast_zero_attr->set_type(onnx::AttributeProto_AttributeType_INT);
-                cast_zero_attr->set_i(input_math_type);
+                std::string cast_zero_name = lowered_zero_name;
+                if (!runtime_zero_is_math_type)
+                {
+                    cast_zero_name = MakeLoweredName(node_base, "zero_cast", ++unique_id);
+                    auto* cast_zero =
+                        AppendNode(lowered_nodes, node, "Cast", MakeLoweredName(node_base, "cast_zero", unique_id),
+                                   {lowered_zero_name}, {cast_zero_name});
+                    auto* cast_zero_attr = cast_zero->add_attribute();
+                    cast_zero_attr->set_name("to");
+                    cast_zero_attr->set_type(onnx::AttributeProto_AttributeType_INT);
+                    cast_zero_attr->set_i(input_math_type);
+                }
 
                 dequantized_name = MakeLoweredName(node_base, "shifted", ++unique_id);
                 AppendNode(lowered_nodes, node, "Sub", MakeLoweredName(node_base, "sub", unique_id),

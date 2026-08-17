@@ -1057,6 +1057,36 @@ TEST(TensorRTRTXProtoPreprocessingTest, RuntimeScalarDequantizeLinearWithoutZero
     EXPECT_EQ(output_node->doc_string(), kOriginalDocString);
 }
 
+// Runtime per-axis parameters need an explicit rank-aligned reshape before
+// ordinary ONNX broadcasting can reproduce DequantizeLinear axis semantics.
+TEST(TensorRTRTXProtoPreprocessingTest, RuntimePerAxisDequantizeLinearLowersToArithmetic)
+{
+    auto model = MakeModel(13);
+    auto* graph = model.mutable_graph();
+    model_builder::AddValueInfo(graph->mutable_input(), "x", kInt8, {2, 3, 2, 4});
+    model_builder::AddValueInfo(graph->mutable_input(), "scale", kFp32, {3});
+    model_builder::AddValueInfo(graph->mutable_input(), "zero_point", kInt8, {3});
+    model_builder::AddValueInfo(graph->mutable_output(), "y", kFp32, {2, 3, 2, 4});
+    auto* dq = model_builder::AddNode(graph, "dq", "DequantizeLinear", {"x", "scale", "zero_point"}, {"y"});
+    auto* axis_attr = dq->add_attribute();
+    axis_attr->set_name("axis");
+    axis_attr->set_type(onnx::AttributeProto_AttributeType_INT);
+    axis_attr->set_i(1);
+    dq->set_doc_string(kOriginalDocString);
+
+    trt_rtx_ep::RunTensorRtProtoPreprocessing(model);
+
+    EXPECT_EQ(CountNodes(model.graph(), "DequantizeLinear"), 0u);
+    EXPECT_EQ(CountNodes(model.graph(), "Reshape"), 2u);
+    EXPECT_EQ(CountNodes(model.graph(), "Cast"), 2u);
+    EXPECT_EQ(CountNodes(model.graph(), "Sub"), 1u);
+    EXPECT_EQ(CountNodes(model.graph(), "Mul"), 1u);
+    const auto* output_node = FindNodeByOutput(model.graph(), "y");
+    ASSERT_NE(output_node, nullptr);
+    EXPECT_EQ(output_node->op_type(), "Mul");
+    EXPECT_EQ(output_node->doc_string(), kOriginalDocString);
+}
+
 // QuantizeLinear uses the same runtime-parameter rule. The emitted graph must
 // implement division, zero-point shift, ties-to-even rounding, saturation,
 // and the final integer cast while retaining the original output identity.

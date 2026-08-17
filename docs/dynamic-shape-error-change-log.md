@@ -434,3 +434,57 @@ Detailed TensorRT logging confirmed that the target was rewritten to Cast/Mul, b
 - Per-channel runtime scale/zero-point tensors are not lowered yet; they require axis-aware runtime reshape/broadcast handling.
 - Scalar Q/DQ without a zero-point still follows the native TensorRT path and retains the separate scalar-rank `{}` to `{1}` issue.
 - FP16/BF16 scales, INT16/UINT16, block quantization, INT4, and Float8 remain outside this phase.
+
+## DQ follow-up Step 2: runtime per-axis INT8/UINT8 parameters
+
+Branch: `codex/dq-remaining-fixes`
+
+### Root cause
+
+Four remaining per-channel tests provide both `scale` and `zero_point` as runtime rank-one tensors. The Phase 1 gate accepted runtime parameters only when they were scalar, so TensorRT received the original `DequantizeLinear`. Its native Q/DQ importer requires `zero_point` to be an initializer and rejected these graphs.
+
+The first Step 2 diagnostic build also exposed a separate TensorRT restriction: a runtime UINT8 zero-point tensor cannot be passed directly through `Reshape`. Casting the zero point before reshaping is required.
+
+### Source change
+
+`src/qdq_lowering.cc` now recognizes a deliberately narrow runtime per-axis DQ form:
+
+- `scale` and `zero_point` are both runtime rank-one tensors with the same known length greater than one;
+- input rank and dimensions are static;
+- the normalized ONNX `axis` is valid, and the parameter length exactly matches that input dimension;
+- scale is FP32;
+- input and zero point have the same INT8 or UINT8 type;
+- `block_size` is absent or no greater than one.
+
+For a non-trailing axis, scale is reshaped to an ONNX-broadcastable rank-aligned shape such as `{1, C, 1, 1}`. The zero point is first cast to FP32 and then reshaped, avoiding TensorRT's UINT8-Reshape rejection. The final equivalent graph is Cast/Reshape/Sub/Mul. A graph-level preprocessing test was added for a rank-four, axis-one case.
+
+This does not broaden runtime QuantizeLinear handling, dynamic input dimensions, block quantization, mismatched parameter lengths/types, or non-FP32 scales.
+
+### Artifact and tests
+
+```text
+Artifact: C:\Users\amadhavasrir\Downloads\bulding_files\test-env\onnxruntime_providers_nv_tensorrt_rtx.dq-step2-per-axis-final.dll
+SHA256: 4AA2193F268E44F69BDCED7232580E68ADA4CA8DF563A5D3DADF90CF969121C2
+```
+
+All four previously failing targets passed:
+
+```text
+DequantizeLinearOpTest.Per_Channel_Axis_Default
+DequantizeLinearOpTest.Per_Channel_Axis_1_int8
+DequantizeLinearContribOpTest.DequantizeLinear_1
+DequantizeLinearContribOpTest.DequantizeLinear_2
+```
+
+The target run contained zero `Invalid Node` and zero `No graph will run on TensorRT execution provider` messages, confirming that their success was not caused by graph rejection followed by CPU execution.
+
+These controls also passed:
+
+```text
+DequantizeLinearOpTest.Per_Channel_Axis_0
+DequantizeLinearOpTest.Per_Channel_Neg_2
+DequantizeLinearOpTest.Per_Channel_Axis_1_int32
+DequantizeLinearOpTest.Without_Zero_Point
+```
+
+The INT32 control retains its pre-existing native TensorRT rejection/CPU path; Step 2 intentionally does not change that form.
