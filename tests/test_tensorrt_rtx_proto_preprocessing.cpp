@@ -31,6 +31,8 @@ namespace
 
 constexpr int32_t kFp32 = onnx::TensorProto_DataType_FLOAT;
 constexpr int32_t kFp16 = onnx::TensorProto_DataType_FLOAT16;
+constexpr int32_t kInt8 = onnx::TensorProto_DataType_INT8;
+constexpr int32_t kUint8 = onnx::TensorProto_DataType_UINT8;
 constexpr int32_t kInt32 = onnx::TensorProto_DataType_INT32;
 constexpr const char* kOriginalDocString = "42";
 
@@ -1002,6 +1004,60 @@ TEST(TensorRTRTXProtoPreprocessingTest, RunTensorRtProtoPreprocessing_AppliesMul
     ASSERT_NE(attribute, nullptr);
     EXPECT_EQ(attribute->type(), onnx::AttributeProto_AttributeType_INT);
     EXPECT_EQ(attribute->i(), 4096);
+}
+
+// TensorRT's native Q/DQ layers reject a runtime zero_point during engine
+// validation even though the parser accepts the node during capability
+// discovery. Verify that the shared preprocessing path removes native DQ and
+// preserves all three runtime inputs as ordinary arithmetic inputs.
+TEST(TensorRTRTXProtoPreprocessingTest, RuntimeScalarDequantizeLinearLowersToArithmetic)
+{
+    auto model = MakeModel(10);
+    auto* graph = model.mutable_graph();
+    model_builder::AddValueInfo(graph->mutable_input(), "x", kInt8, {4});
+    model_builder::AddValueInfo(graph->mutable_input(), "scale", kFp32, {});
+    model_builder::AddValueInfo(graph->mutable_input(), "zero_point", kInt8, {});
+    model_builder::AddValueInfo(graph->mutable_output(), "y", kFp32, {4});
+    auto* dq = model_builder::AddNode(graph, "dq", "DequantizeLinear", {"x", "scale", "zero_point"}, {"y"});
+    dq->set_doc_string(kOriginalDocString);
+
+    trt_rtx_ep::RunTensorRtProtoPreprocessing(model);
+
+    EXPECT_EQ(CountNodes(model.graph(), "DequantizeLinear"), 0u);
+    EXPECT_EQ(CountNodes(model.graph(), "Sub"), 1u);
+    EXPECT_EQ(CountNodes(model.graph(), "Mul"), 1u);
+    const auto* output_node = FindNodeByOutput(model.graph(), "y");
+    ASSERT_NE(output_node, nullptr);
+    EXPECT_EQ(output_node->op_type(), "Mul");
+    EXPECT_EQ(output_node->doc_string(), kOriginalDocString);
+}
+
+// QuantizeLinear uses the same runtime-parameter rule. The emitted graph must
+// implement division, zero-point shift, ties-to-even rounding, saturation,
+// and the final integer cast while retaining the original output identity.
+TEST(TensorRTRTXProtoPreprocessingTest, RuntimeScalarQuantizeLinearLowersToArithmetic)
+{
+    auto model = MakeModel(10);
+    auto* graph = model.mutable_graph();
+    model_builder::AddValueInfo(graph->mutable_input(), "x", kFp32, {3, 4});
+    model_builder::AddValueInfo(graph->mutable_input(), "scale", kFp32, {});
+    model_builder::AddValueInfo(graph->mutable_input(), "zero_point", kUint8, {});
+    model_builder::AddValueInfo(graph->mutable_output(), "y", kUint8, {3, 4});
+    auto* q = model_builder::AddNode(graph, "q", "QuantizeLinear", {"x", "scale", "zero_point"}, {"y"});
+    q->set_doc_string(kOriginalDocString);
+
+    trt_rtx_ep::RunTensorRtProtoPreprocessing(model);
+
+    EXPECT_EQ(CountNodes(model.graph(), "QuantizeLinear"), 0u);
+    EXPECT_EQ(CountNodes(model.graph(), "Div"), 1u);
+    EXPECT_EQ(CountNodes(model.graph(), "Add"), 1u);
+    EXPECT_EQ(CountNodes(model.graph(), "Round"), 1u);
+    EXPECT_EQ(CountNodes(model.graph(), "Max"), 1u);
+    EXPECT_EQ(CountNodes(model.graph(), "Min"), 1u);
+    const auto* output_node = FindNodeByOutput(model.graph(), "y");
+    ASSERT_NE(output_node, nullptr);
+    EXPECT_EQ(output_node->op_type(), "Cast");
+    EXPECT_EQ(output_node->doc_string(), kOriginalDocString);
 }
 
 // Intent:

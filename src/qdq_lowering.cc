@@ -1409,18 +1409,33 @@ bool TryFoldConstantDequantizeLinear(onnx::GraphProto& graph, GraphIndex& index,
 //     pipelines, fp32 otherwise); respect that choice.
 // Exceptions are handled in GetQuantizeArithmeticType (int16/uint16 outputs
 // need fp32 even when the scale is fp16/bf16).
-std::optional<int32_t> GetArithmeticTypeForScale(const onnx::TensorProto& scale_tensor)
+std::optional<int32_t> GetArithmeticTypeForScaleType(int32_t scale_type)
 {
-    switch (scale_tensor.data_type())
+    switch (scale_type)
     {
     case onnx::TensorProto_DataType_FLOAT:
     case onnx::TensorProto_DataType_FLOAT16:
     case onnx::TensorProto_DataType_BFLOAT16:
     case onnx::TensorProto_DataType_DOUBLE:
-        return scale_tensor.data_type();
+        return scale_type;
     default:
         return std::nullopt;
     }
+}
+
+// The first runtime-parameter lowering phase intentionally accepts only
+// scalar (or one-element) scale/zero-point tensors. They need no axis reshape,
+// so the existing initializer-only broadcast machinery remains unchanged.
+bool IsKnownScalarOrOneElementTensor(const GraphIndex& index, const std::string& name)
+{
+    std::vector<int64_t> shape;
+    if (!index.TryGetTensorShape(name, shape))
+    {
+        return false;
+    }
+
+    return shape.empty() ||
+           std::all_of(shape.begin(), shape.end(), [](int64_t dim) { return dim == 1; });
 }
 
 // "Asymmetric" is only asymmetric if the zp tensor exists AND carries at
@@ -1500,9 +1515,9 @@ std::optional<int32_t> GetDequantizeIntegerMathType(int32_t input_type)
 // the top) and bf16 (spacing 256 near the top). Doing round(x/scale)+zp and
 // the final Max/Min in fp16/bf16 would round qmax to inf or snap rounded
 // values to the wrong integer, producing silently-wrong quantization.
-std::optional<int32_t> GetQuantizeArithmeticType(const onnx::TensorProto& scale_tensor, int32_t output_type)
+std::optional<int32_t> GetQuantizeArithmeticType(int32_t scale_type, int32_t output_type)
 {
-    auto arithmetic_type = GetArithmeticTypeForScale(scale_tensor);
+    auto arithmetic_type = GetArithmeticTypeForScaleType(scale_type);
     if (!arithmetic_type)
     {
         return std::nullopt;
@@ -1921,10 +1936,17 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
             continue;
         }
 
-        // Gate 1: scale must be a readable, spec-compliant constant
-        // (positive and finite). See IsPositiveScaleTensor for rationale.
+        // Gate 1: constant scales must be readable, positive, and finite.
+        // Runtime scales are accepted only for the scalar/one-element phase-1
+        // path. Their values cannot be inspected during compilation, but the
+        // ONNX contract already requires callers to supply a positive scale.
         const auto* scale_tensor = index.FindInitializer(node.input(1));
-        if (scale_tensor == nullptr || !IsPositiveScaleTensor(*scale_tensor))
+        const auto scale_type = scale_tensor != nullptr ? std::optional<int32_t>(scale_tensor->data_type())
+                                                        : index.FindTensorElementType(node.input(1));
+        const bool has_runtime_scalar_scale =
+            scale_tensor == nullptr && scale_type && IsKnownScalarOrOneElementTensor(index, node.input(1));
+        if ((scale_tensor != nullptr && !IsPositiveScaleTensor(*scale_tensor)) ||
+            (scale_tensor == nullptr && !has_runtime_scalar_scale))
         {
             *lowered_nodes.Add() = node;
             continue;
@@ -1934,6 +1956,15 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
         // as zp=0"; it is NOT an error, so no bail-out on this line.
         const auto* zero_point_tensor =
             (node.input_size() > 2 && !node.input(2).empty()) ? index.FindInitializer(node.input(2)) : nullptr;
+        const bool has_zero_point_input = node.input_size() > 2 && !node.input(2).empty();
+        const auto zero_point_type = has_zero_point_input
+                                         ? (zero_point_tensor != nullptr
+                                                ? std::optional<int32_t>(zero_point_tensor->data_type())
+                                                : index.FindTensorElementType(node.input(2)))
+                                         : std::nullopt;
+        const bool has_runtime_scalar_zero_point =
+            has_zero_point_input && zero_point_tensor == nullptr && zero_point_type &&
+            IsKnownScalarOrOneElementTensor(index, node.input(2));
 
         // Gate 2: input dtype must be known. Without it we can't pick
         // integer-math widening (int32/uint32 -> int64) nor apply DQ-2.
@@ -1946,7 +1977,7 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
 
         // Gate 3: scale dtype must be a supported floating type. This also
         // anchors the dtype of every arithmetic op we are about to emit.
-        const auto arithmetic_type = GetArithmeticTypeForScale(*scale_tensor);
+        const auto arithmetic_type = scale_type ? GetArithmeticTypeForScaleType(*scale_type) : std::nullopt;
         if (!arithmetic_type)
         {
             *lowered_nodes.Add() = node;
@@ -1960,22 +1991,30 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
         if (node.op_type() == "DequantizeLinear")
         {
             const auto dequantize_decision = EvaluateDequantizeLowering(node, index, zero_point_tensor, *input_type);
-            if (!dequantize_decision.should_lower)
+            const bool can_lower_runtime_scalar_parameters =
+                has_runtime_scalar_zero_point && *scale_type == onnx::TensorProto_DataType_FLOAT &&
+                (*input_type == onnx::TensorProto_DataType_INT8 ||
+                 *input_type == onnx::TensorProto_DataType_UINT8) &&
+                *zero_point_type == *input_type;
+            if (!can_lower_runtime_scalar_parameters && !dequantize_decision.should_lower)
             {
                 *lowered_nodes.Add() = node;
                 continue;
             }
 
-            if (const auto* input_initializer = index.FindInitializer(node.input(0)))
+            if (scale_tensor != nullptr)
             {
-                // Constant DQ is folded to a float initializer plus a trivial Identity so the
-                // lowered graph still exposes the original tensor name to downstream nodes.
-                if (TryFoldConstantDequantizeLinear(graph, index, lowered_nodes, node, *input_initializer,
-                                                    *scale_tensor, zero_point_tensor, *arithmetic_type, axis_attr,
-                                                    block_size, unique_id, lowered_qdq_info))
+                if (const auto* input_initializer = index.FindInitializer(node.input(0)))
                 {
-                    ++lowered_qdq_info.lowered_node_count;
-                    continue;
+                    // Constant DQ is folded to a float initializer plus a trivial Identity so the
+                    // lowered graph still exposes the original tensor name to downstream nodes.
+                    if (TryFoldConstantDequantizeLinear(graph, index, lowered_nodes, node, *input_initializer,
+                                                        *scale_tensor, zero_point_tensor, *arithmetic_type, axis_attr,
+                                                        block_size, unique_id, lowered_qdq_info))
+                    {
+                        ++lowered_qdq_info.lowered_node_count;
+                        continue;
+                    }
                 }
             }
 
@@ -1995,16 +2034,19 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
             // Integer-first subtraction preserves exact differences for int32/uint32
             // before we finally cast to the floating arithmetic type used by scale.
             std::string lowered_scale_name = node.input(1);
-            std::string lowered_zero_name = zero_point_tensor != nullptr ? node.input(2) : std::string();
+            std::string lowered_zero_name = has_zero_point_input ? node.input(2) : std::string();
 
-            ++unique_id;
-            if (!MaybeAddAxisReshape(graph, index, lowered_nodes, node, lowered_scale_name,
-                                     MakeLoweredName(node_base, "scale", unique_id),
-                                     index.FindTensorRank(node.input(0)), axis_attr, *scale_tensor, block_size,
-                                     unique_id, lowered_scale_name))
+            if (scale_tensor != nullptr)
             {
-                *lowered_nodes.Add() = node;
-                continue;
+                ++unique_id;
+                if (!MaybeAddAxisReshape(graph, index, lowered_nodes, node, lowered_scale_name,
+                                         MakeLoweredName(node_base, "scale", unique_id),
+                                         index.FindTensorRank(node.input(0)), axis_attr, *scale_tensor, block_size,
+                                         unique_id, lowered_scale_name))
+                {
+                    *lowered_nodes.Add() = node;
+                    continue;
+                }
             }
 
             if (zero_point_tensor != nullptr)
@@ -2081,17 +2123,30 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
 
         if (node.op_type() == "QuantizeLinear")
         {
-            int32_t output_type =
-                zero_point_tensor != nullptr ? zero_point_tensor->data_type() : onnx::TensorProto_DataType_UINT8;
-            if (zero_point_tensor == nullptr)
+            int32_t output_type = zero_point_type.value_or(onnx::TensorProto_DataType_UINT8);
+            if (!has_zero_point_input)
             {
-                if (auto output_dtype = FindIntAttribute(node, "output_dtype"))
+                if (auto output_dtype_attr = FindIntAttribute(node, "output_dtype"))
                 {
-                    output_type = static_cast<int32_t>(*output_dtype);
+                    output_type = static_cast<int32_t>(*output_dtype_attr);
+                }
+                else if (auto output_element_type = index.FindTensorElementType(node.output(0)))
+                {
+                    output_type = *output_element_type;
                 }
             }
 
-            if (ShouldLowerQuantizeLinear(node, *scale_tensor, zero_point_tensor, output_type))
+            // Phase 1 deliberately limits runtime-parameter Q to UINT8. An
+            // INT8 boundary test showed that TRT's FP32 Div optimization can
+            // move a quotient by one ULP across an x.5 rounding boundary,
+            // producing -128 where ORT produces -127. Keep INT8 native until
+            // an exact rounding formulation is available.
+            const bool should_lower_quantize =
+                (has_runtime_scalar_zero_point && *scale_type == onnx::TensorProto_DataType_FLOAT &&
+                 output_type == onnx::TensorProto_DataType_UINT8) ||
+                (scale_tensor != nullptr &&
+                 ShouldLowerQuantizeLinear(node, *scale_tensor, zero_point_tensor, output_type));
+            if (should_lower_quantize)
             {
                 // Lower asymmetric Q into explicit arithmetic:
                 //
@@ -2109,7 +2164,7 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
                 //
                 // This mirrors the spec math while keeping TRT away from unsupported
                 // native asymmetric Q paths.
-                const auto quantize_arithmetic_type = GetQuantizeArithmeticType(*scale_tensor, output_type);
+                const auto quantize_arithmetic_type = GetQuantizeArithmeticType(*scale_type, output_type);
                 if (!quantize_arithmetic_type)
                 {
                     *lowered_nodes.Add() = node;
@@ -2125,18 +2180,21 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
                 }
 
                 std::string lowered_scale_name = node.input(1);
-                std::string lowered_zero_name = zero_point_tensor != nullptr ? node.input(2) : std::string();
-                ++unique_id;
-                if (!MaybeAddAxisReshape(graph, index, lowered_nodes, node, lowered_scale_name,
-                                         MakeLoweredName(node_base, "scale", unique_id),
-                                         index.FindTensorRank(node.input(0)), axis_attr, *scale_tensor, block_size,
-                                         unique_id, lowered_scale_name))
+                std::string lowered_zero_name = has_zero_point_input ? node.input(2) : std::string();
+                if (scale_tensor != nullptr)
                 {
-                    *lowered_nodes.Add() = node;
-                    continue;
+                    ++unique_id;
+                    if (!MaybeAddAxisReshape(graph, index, lowered_nodes, node, lowered_scale_name,
+                                             MakeLoweredName(node_base, "scale", unique_id),
+                                             index.FindTensorRank(node.input(0)), axis_attr, *scale_tensor, block_size,
+                                             unique_id, lowered_scale_name))
+                    {
+                        *lowered_nodes.Add() = node;
+                        continue;
+                    }
                 }
 
-                if (*quantize_arithmetic_type != scale_tensor->data_type())
+                if (*quantize_arithmetic_type != *scale_type)
                 {
                     const std::string cast_scale_name = MakeLoweredName(node_base, "scale_cast", ++unique_id);
                     auto* cast_scale =
