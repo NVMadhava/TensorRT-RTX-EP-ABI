@@ -1032,6 +1032,31 @@ TEST(TensorRTRTXProtoPreprocessingTest, RuntimeScalarDequantizeLinearLowersToAri
     EXPECT_EQ(output_node->doc_string(), kOriginalDocString);
 }
 
+// TRT's native scalar DQ path changes a rank-zero output into a one-element
+// vector when zero_point is absent. Verify that the runtime scalar form lowers
+// to Cast/Mul without introducing a synthetic subtraction or changing y.
+TEST(TensorRTRTXProtoPreprocessingTest, RuntimeScalarDequantizeLinearWithoutZeroPointLowersToArithmetic)
+{
+    auto model = MakeModel(10);
+    auto* graph = model.mutable_graph();
+    model_builder::AddValueInfo(graph->mutable_input(), "x", kInt8, {});
+    model_builder::AddValueInfo(graph->mutable_input(), "scale", kFp32, {});
+    model_builder::AddValueInfo(graph->mutable_output(), "y", kFp32, {});
+    auto* dq = model_builder::AddNode(graph, "dq", "DequantizeLinear", {"x", "scale"}, {"y"});
+    dq->set_doc_string(kOriginalDocString);
+
+    trt_rtx_ep::RunTensorRtProtoPreprocessing(model);
+
+    EXPECT_EQ(CountNodes(model.graph(), "DequantizeLinear"), 0u);
+    EXPECT_EQ(CountNodes(model.graph(), "Cast"), 1u);
+    EXPECT_EQ(CountNodes(model.graph(), "Sub"), 0u);
+    EXPECT_EQ(CountNodes(model.graph(), "Mul"), 1u);
+    const auto* output_node = FindNodeByOutput(model.graph(), "y");
+    ASSERT_NE(output_node, nullptr);
+    EXPECT_EQ(output_node->op_type(), "Mul");
+    EXPECT_EQ(output_node->doc_string(), kOriginalDocString);
+}
+
 // QuantizeLinear uses the same runtime-parameter rule. The emitted graph must
 // implement division, zero-point shift, ties-to-even rounding, saturation,
 // and the final integer cast while retaining the original output identity.

@@ -1438,6 +1438,12 @@ bool IsKnownScalarOrOneElementTensor(const GraphIndex& index, const std::string&
            std::all_of(shape.begin(), shape.end(), [](int64_t dim) { return dim == 1; });
 }
 
+bool IsKnownScalarTensor(const GraphIndex& index, const std::string& name)
+{
+    std::vector<int64_t> shape;
+    return index.TryGetTensorShape(name, shape) && shape.empty();
+}
+
 // "Asymmetric" is only asymmetric if the zp tensor exists AND carries at
 // least one non-zero element. An absent zp (no input or empty-string input)
 // and a zp initializer full of zeros are both treated as symmetric (zp=0).
@@ -1991,11 +1997,22 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
         if (node.op_type() == "DequantizeLinear")
         {
             const auto dequantize_decision = EvaluateDequantizeLowering(node, index, zero_point_tensor, *input_type);
-            const bool can_lower_runtime_scalar_parameters =
+            const bool can_lower_runtime_scalar_zero_point =
                 has_runtime_scalar_zero_point && *scale_type == onnx::TensorProto_DataType_FLOAT &&
                 (*input_type == onnx::TensorProto_DataType_INT8 ||
                  *input_type == onnx::TensorProto_DataType_UINT8) &&
                 *zero_point_type == *input_type;
+            // TRT's native scalar DQ path reshapes a rank-zero output to {1}
+            // when zero_point is omitted. Emit Cast(x) * scale for that exact
+            // runtime-scalar form so the ONNX scalar output rank is preserved.
+            const bool can_lower_runtime_scalar_without_zero_point =
+                !has_zero_point_input && has_runtime_scalar_scale &&
+                *scale_type == onnx::TensorProto_DataType_FLOAT &&
+                (*input_type == onnx::TensorProto_DataType_INT8 ||
+                 *input_type == onnx::TensorProto_DataType_UINT8) &&
+                IsKnownScalarTensor(index, node.input(0));
+            const bool can_lower_runtime_scalar_parameters =
+                can_lower_runtime_scalar_zero_point || can_lower_runtime_scalar_without_zero_point;
             if (!can_lower_runtime_scalar_parameters && !dequantize_decision.should_lower)
             {
                 *lowered_nodes.Add() = node;

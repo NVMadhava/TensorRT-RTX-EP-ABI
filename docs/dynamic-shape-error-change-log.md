@@ -390,6 +390,44 @@ These remaining failures do not exercise the newly supported runtime scalar `flo
 
 The full-suite result materially increases confidence in runtime scalar DQ: it fixes five baseline failures and produces no new failures across the enabled inventory. It does not prove behavior for arbitrary invalid runtime scale values because a runtime value cannot be checked during graph preprocessing; ONNX still requires scale to be positive.
 
+## DQ follow-up Step 1: scalar runtime DQ without zero point
+
+Branch: `codex/dq-remaining-fixes`
+
+### Root cause
+
+`DequantizeLinearOpTest.Without_Zero_Point` has rank-zero `x`, `scale`, and `y`, with no zero-point input. The first runtime-scalar lowering required a runtime zero point, so this form remained native. TensorRT inserted an internal reshape and returned `y` with shape `{1}` instead of the ONNX scalar shape `{}`.
+
+### Source change
+
+`src/qdq_lowering.cc` now lowers only the following missing-zero-point form:
+
+- `x` has a statically known scalar shape;
+- `scale` is a runtime scalar/one-element FP32 tensor;
+- `x` is INT8 or UINT8;
+- zero point is absent.
+
+The emitted graph is `Cast(x to FP32) -> Mul(scale)`. This is exactly `(x - 0) * scale` and preserves the scalar output rank. A graph-level preprocessing test was added to `tests/test_tensorrt_rtx_proto_preprocessing.cpp`; the current build cache still has `BUILD_TESTS=OFF`, so integration tests provide the executed-path evidence for this step.
+
+### Artifact and tests
+
+```text
+Artifact: C:\Users\amadhavasrir\Downloads\bulding_files\test-env\onnxruntime_providers_nv_tensorrt_rtx.dq-step1-scalar-no-zp.dll
+SHA256: 46D5AE62E2FB95C7D32A71DAEFA3A904CB76B6EF160FF2FA5D30E2EA3F04925B
+```
+
+Target and controls all passed:
+
+```text
+DequantizeLinearOpTest.Without_Zero_Point
+DequantizeLinearOpTest.Scalar
+DequantizeLinearOpTest.No_Zero_Point_int8
+DequantizeLinearOpTest.No_Zero_Point_uint8
+DequantizeLinearOpTest.Int8
+```
+
+Detailed TensorRT logging confirmed that the target was rewritten to Cast/Mul, built as a Myelin engine, and retained `x (Int8[]) -> y (Float[])`; it was not a CPU-fallback pass.
+
 ### Remaining limitations and next work
 
 - Runtime INT8 QuantizeLinear needs an exact rounding strategy before it can use arithmetic lowering.
