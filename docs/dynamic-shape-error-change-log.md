@@ -622,3 +622,59 @@ The seven fixed names are exactly the seven DQ targets listed above. All 82 enab
 As in the previous full run, the resume script wrote the five disabled names to `hangs.txt` because a zero-test invocation is interpreted as “no progress.” Their batch logs report zero executed tests; they are not process hangs.
 
 Final provider-suite failure count after all four follow-up steps: **464**.
+
+## Pad runtime-profile feasibility investigation
+
+### Scope and failure inventory
+
+No provider source behavior was changed in this investigation. The final 464-failure inventory contains 114 Pad tests
+classified as dynamic shape/profile failures. They consist of 28 typed Pad scenarios repeated for the four datatypes
+currently claimed by TensorRT RTX in this test set (112 tests), plus `PadOpTest.BoolType` and
+`PadOpTest.ConstantPadAxes`.
+
+The shared cause is that opset 11+ models supply `pads` as a runtime graph input. TensorRT classifies that input as a
+shape tensor, while the current implicit-profile builder copies its container dimension (for example `[2]`) instead of
+constructing bounds for its two runtime values.
+
+### Provider-test controls
+
+`PadOpTest/0.Pad_Constant_1D` failed without a profile and passed with both of the following explicit profiles:
+
+```text
+fixed:    min=[1,2], opt=[1,2], max=[1,2]
+variable: min=[0,0], opt=[1,2], max=[2,3]
+```
+
+`PadOpTest/0.Pad_Constant_2D_negative_pads_1` also passed with a profile containing negative and positive values. A
+deliberately over-broad minimum point caused TensorRT to warn that the profile was not self-consistent, demonstrating
+that Pad bounds must describe valid combinations rather than merely large per-element ranges.
+
+One shared nonnegative profile was also applied to four representative float tests covering every Pad mode exercised by
+the failure set. `Pad_Spec_Example` (constant), `Pad_Edge_1D`, `Pad_Reflect_1D`, and `Pad_Wrap_1D` all passed: **4/4**.
+
+### Same-engine runtime-value experiment
+
+An isolated experiment under the untracked directory `build-phase1-ninja\pad-profile-experiment` created one Pad engine
+with CPU fallback disabled and ran the same session repeatedly. With `min=[-1,-1]`, `opt=[0,0]`, and `max=[2,2]`, all
+nine runtime pairs produced the expected result:
+
+```text
+[-1,-1], [-1,0], [0,-1], [-1,1], [1,-1],
+[0,0], [1,1], [2,0], [0,2]
+```
+
+This proves that, unlike native CumSum's axis, Pad values do not have to be build-time constants. One TensorRT engine
+can execute different positive and negative pad values when they remain inside a valid optimization profile.
+
+### Current conclusion and implementation boundary
+
+Runtime engine creation is not intrinsically required for Pad. The remaining problem is constructing sound implicit
+bounds without seeing the runtime values. For each input dimension, pre-padding and post-padding are correlated because
+their sum determines the output extent. A single rectangular min/max profile cannot represent every legal negative-pad
+combination without also containing invalid points; TensorRT reports such invalid profile points during shape analysis.
+
+Approximately 73 of the 114 failing Pad test names belong to scenarios whose observed test feeds are nonnegative and do
+not use runtime `axes`. Static input/output shapes could produce bounded profiles that cover those observed feeds, but
+doing so would implicitly exclude other ONNX-valid negative values that the same model could receive at runtime. This is
+therefore a possible deliberately scoped policy/prototype, not yet a generally correct Pad implementation. No provider
+code change has been made pending review of that semantic tradeoff.
