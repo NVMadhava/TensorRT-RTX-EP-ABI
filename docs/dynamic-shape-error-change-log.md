@@ -25,7 +25,7 @@ The Git commits are the authoritative code history. This document records the re
 | Order | Commit | Area | Files | Verification status | Integration status |
 |---:|---|---|---|---|---|
 | 1 | `d590d0f` | Shape-tensor profile diagnostics and bounds validation | `src/tensorrt_rtx_execution_provider.cc` | Targeted Expand and CumSum investigation completed; CumSum access violation replaced by a controlled initialization failure | Memory-safety portion is a merge candidate; diagnostic log level/noise should be reviewed before final merge |
-| 2 | `0c380a0` | Runtime scalar Q/DQ arithmetic lowering and graph-level tests | `src/qdq_lowering.cc`, `tests/test_tensorrt_rtx_proto_preprocessing.cpp` | Focused DQ and UINT8 Q integration tests and controls passed; source-level tests are added but were not built because the current Ninja cache has `BUILD_TESTS=OFF` | DQ portion is promising; general runtime Q remains experimental because exact rounding equivalence is not yet proven |
+| 2 | `0c380a0` | Runtime scalar Q/DQ arithmetic lowering and graph-level tests | `src/qdq_lowering.cc`, `tests/test_tensorrt_rtx_proto_preprocessing.cpp` | Focused tests passed; a complete batched run produced 4,941 pass / 471 fail / 121 skip, with zero new failures versus baseline | Runtime scalar DQ has full-suite regression evidence; general runtime Q remains experimental because exact rounding equivalence is not yet proven |
 | 3 | documentation commit | Investigation history and integration index | `docs/dynamic-shape-error-change-log.md` | Documentation review | Merge with or after the code commits |
 
 ### Recommended integration procedure
@@ -330,6 +330,65 @@ Additional controls:
 | `QuantizeLinearOpTest.Uint8` | Passed |
 | `QuantizeLinearOpTest.Scalar` | Passed |
 | `QuantizeLinearOpTest.Int8` | Still fails at engine creation by design; unsafe arithmetic result is no longer used |
+
+### Complete batched provider-suite regression
+
+The complete provider inventory was rerun against the Phase 1 DLL in batches, using the same filter as the original baseline:
+
+```text
+-*NvExecutionProviderTest*
+```
+
+Result directory:
+
+```text
+C:\Users\amadhavasrir\Downloads\bulding_files\results\runtime-qdq-full-20260817-152243
+```
+
+The runner enumerated 5,538 names. Five names contain Google's `DISABLED_` marker and therefore intentionally execute zero tests unless `--gtest_also_run_disabled_tests` is supplied. Excluding those five, the result inventory exactly matches the 5,533 enabled-test baseline.
+
+| Result | Baseline | Runtime scalar Q/DQ DLL | Change |
+|---|---:|---:|---:|
+| Passed | 4,930 | 4,941 | +11 |
+| Failed | 482 | 471 | -11 |
+| Skipped | 121 | 121 | 0 |
+| Enabled total | 5,533 | 5,533 | 0 |
+
+Failure-set comparison:
+
+- new failures relative to the baseline: **0**;
+- baseline failures now passing: **11**;
+- genuine hangs or unaccounted enabled tests: **0**.
+
+The five disabled names appear in `hangs.txt` because the existing resume script treats a zero-test batch as "no progress." Their individual logs say `Running 0 tests` and `YOU HAVE ... DISABLED TESTS`; they were not process hangs or crashes.
+
+The 11 newly passing tests divide into five DQ tests, five Q tests, and one shape-profile/CumSum test.
+
+Runtime-scalar DQ accounts for these five improvements:
+
+```text
+DequantizeLinearOpTest.DequantizeLinear_per_tensor_float_int8
+DequantizeLinearOpTest.Int8
+DequantizeLinearOpTest.Int8_Large
+DequantizeLinearOpTest.Scalar
+DequantizeLinearOpTest.Zero_Point_int8
+```
+
+Across the complete inventory, 82 executed test names contain `DequantizeLinear`: 75 passed and 7 failed. All seven failures were already present in the 482-failure baseline, so the DQ change introduced no observed DQ regression:
+
+```text
+DequantizeLinearOpTest.Int4_LargeInitializerInput
+DequantizeLinearOpTest.Int4NoZeroPoint
+DequantizeLinearOpTest.Without_Zero_Point
+DequantizeLinearOpTest.Per_Channel_Axis_Default
+DequantizeLinearOpTest.Per_Channel_Axis_1_int8
+DequantizeLinearContribOpTest.DequantizeLinear_1
+DequantizeLinearContribOpTest.DequantizeLinear_2
+```
+
+These remaining failures do not exercise the newly supported runtime scalar `float32` scale plus matching `int8`/`uint8` zero-point form. They cover forms such as INT4, omitted zero point, per-channel parameters, and separate contrib cases.
+
+The full-suite result materially increases confidence in runtime scalar DQ: it fixes five baseline failures and produces no new failures across the enabled inventory. It does not prove behavior for arbitrary invalid runtime scale values because a runtime value cannot be checked during graph preprocessing; ONNX still requires scale to be positive.
 
 ### Remaining limitations and next work
 
