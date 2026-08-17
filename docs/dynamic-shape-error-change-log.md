@@ -593,3 +593,32 @@ DequantizeLinearContribOpTest.DequantizeLinear_2
 ```
 
 That focused run contained zero `Invalid Node`, zero `No graph will run on TensorRT execution provider`, and zero serialized-engine build errors. A complete batched provider-suite run is still required to establish the final global failure count.
+
+### Complete batched regression after Steps 1-4
+
+Result directory:
+
+```text
+C:\Users\amadhavasrir\Downloads\bulding_files\results\dq-four-steps-full-20260817-164548
+```
+
+The runner enumerated 5,538 names. Five contain Google's `DISABLED_` marker and intentionally execute zero tests without `--gtest_also_run_disabled_tests`. Excluding those five, all 5,533 enabled tests produced a terminal result.
+
+| Result | Before DQ follow-ups | After Steps 1-4 | Change |
+|---|---:|---:|---:|
+| Passed | 4,941 | 4,948 | +7 |
+| Failed | 471 | 464 | -7 |
+| Skipped | 121 | 121 | 0 |
+| Enabled total | 5,533 | 5,533 | 0 |
+
+Failure-set comparison found:
+
+- newly introduced failures: **0**;
+- previous failures now passing: **7**;
+- genuine hangs or missing enabled tests: **0**.
+
+The seven fixed names are exactly the seven DQ targets listed above. All 82 enabled test names containing `DequantizeLinear` now pass: **82 passed, 0 failed**.
+
+As in the previous full run, the resume script wrote the five disabled names to `hangs.txt` because a zero-test invocation is interpreted as “no progress.” Their batch logs report zero executed tests; they are not process hangs.
+
+Final provider-suite failure count after all four follow-up steps: **464**.
