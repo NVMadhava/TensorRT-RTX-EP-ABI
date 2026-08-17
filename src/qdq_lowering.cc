@@ -1450,6 +1450,17 @@ bool IsKnownOneDimensionalTensor(const GraphIndex& index, const std::string& nam
     return index.TryGetTensorShape(name, shape) && shape.size() == 1 && shape.front() > 1;
 }
 
+std::optional<int64_t> GetKnownOddVectorLength(const GraphIndex& index, const std::string& name)
+{
+    std::vector<int64_t> shape;
+    if (!index.TryGetTensorShape(name, shape) || shape.size() != 1 || shape[0] <= 0 || shape[0] % 2 == 0)
+    {
+        return std::nullopt;
+    }
+    return shape[0];
+}
+
+
 struct RuntimePerAxisParameterInfo
 {
     int64_t input_rank;
@@ -2065,6 +2076,46 @@ LoweredQdqInfo RunQdqLoweringForTensorRt(onnx::ModelProto& model_proto)
         const auto axis_attr = FindIntAttribute(node, "axis");
         const int64_t block_size = FindIntAttribute(node, "block_size").value_or(0);
         const std::string node_base = !node.name().empty() ? node.name() : node.output(0);
+
+        // TensorRT's native INT4 DQ importer requires an even logical input
+        // volume. For the narrow rank-one, missing-zero-point form, concatenate
+        // the vector with itself, dequantize the even 2N vector, then retain the
+        // first N outputs. Those first N values are exactly the ONNX result.
+        const auto odd_int4_vector_length =
+            node.op_type() == "DequantizeLinear" && !has_zero_point_input &&
+                    *input_type == onnx::TensorProto_DataType_INT4 &&
+                    *scale_type == onnx::TensorProto_DataType_FLOAT && has_runtime_scalar_scale
+                ? GetKnownOddVectorLength(index, node.input(0))
+                : std::nullopt;
+        if (odd_int4_vector_length)
+        {
+            const std::string padded_input_name = MakeLoweredName(node_base, "padded_input", ++unique_id);
+            auto* concat = AppendNode(lowered_nodes, node, "Concat", MakeLoweredName(node_base, "pad", unique_id),
+                                      {node.input(0), node.input(0)}, {padded_input_name});
+            auto* concat_axis = concat->add_attribute();
+            concat_axis->set_name("axis");
+            concat_axis->set_type(onnx::AttributeProto_AttributeType_INT);
+            concat_axis->set_i(0);
+
+            const std::string padded_output_name = MakeLoweredName(node_base, "padded_output", ++unique_id);
+            auto* padded_dq = AppendNode(lowered_nodes, node, "DequantizeLinear",
+                                         MakeLoweredName(node_base, "padded_dq", unique_id),
+                                         {padded_input_name, node.input(1)}, {padded_output_name});
+            CopyNodeAttributes(node, *padded_dq);
+
+            const std::string starts_name = MakeLoweredName(node_base, "slice_starts", ++unique_id);
+            const std::string ends_name = MakeLoweredName(node_base, "slice_ends", ++unique_id);
+            const std::string axes_name = MakeLoweredName(node_base, "slice_axes", ++unique_id);
+            const std::string steps_name = MakeLoweredName(node_base, "slice_steps", ++unique_id);
+            AddInt64VectorInitializer(graph, index, starts_name, {0});
+            AddInt64VectorInitializer(graph, index, ends_name, {*odd_int4_vector_length});
+            AddInt64VectorInitializer(graph, index, axes_name, {0});
+            AddInt64VectorInitializer(graph, index, steps_name, {1});
+            AppendNode(lowered_nodes, node, "Slice", MakeLoweredName(node_base, "remove_padding", ++unique_id),
+                       {padded_output_name, starts_name, ends_name, axes_name, steps_name}, {node.output(0)});
+            ++lowered_qdq_info.lowered_node_count;
+            continue;
+        }
 
         if (node.op_type() == "DequantizeLinear")
         {

@@ -488,3 +488,57 @@ DequantizeLinearOpTest.Without_Zero_Point
 ```
 
 The INT32 control retains its pre-existing native TensorRT rejection/CPU path; Step 2 intentionally does not change that form.
+
+## DQ follow-up Step 3: odd-length INT4 without zero point
+
+Branch: `codex/dq-remaining-fixes`
+
+### Root cause and rejected experiments
+
+`DequantizeLinearOpTest.Int4NoZeroPoint` has a rank-one INT4 input with five logical elements, a runtime scalar FP32 scale, and no zero point. TensorRT's ONNX Q/DQ importer rejects an odd number of 4-bit elements before engine creation.
+
+Two smaller-looking approaches were tested and discarded:
+
+1. Adding an explicit scalar INT4 zero point did not help. TensorRT rejected both the original explicit-zero test and the synthesized-zero graph with `4-bit quantization requires an even number of elements`. The restriction is on Q/DQ input volume, not on omission of zero point.
+2. Replacing DQ by `Cast(INT4 to FP32) -> Mul(scale)` passed ONNX parsing but failed TensorRT engine validation. TensorRT does not allow an INT4 tensor to be consumed by a Cast layer.
+
+A third padding experiment using a one-element INT4 zero initializer also failed: TensorRT cannot materialize a tensor whose storage size is only four bits and asserts that its tensor storage size must be byte-aligned.
+
+None of these rejected experiments remains in the committed source.
+
+### Source change
+
+For only a statically known, rank-one, odd-length INT4 `DequantizeLinear` with runtime scalar FP32 scale and no zero point, preprocessing now emits:
+
+```text
+Concat(x, x) -> DequantizeLinear(scale) -> Slice(first N values)
+```
+
+Concatenating the vector with itself changes its logical length from odd `N` to even `2N`, which satisfies TensorRT's native INT4 DQ restriction. Dequantization is elementwise, so the first `N` outputs are exactly the outputs of the original model; Slice removes the duplicate half.
+
+The gate intentionally excludes multidimensional inputs, dynamic lengths, even lengths, explicit zero points, non-INT4 input, and non-FP32/non-scalar scales. A preprocessing test checks that the rewrite contains exactly one Concat, one DequantizeLinear, and one Slice and preserves the output identity metadata.
+
+### Tradeoff
+
+This path temporarily represents `2N` quantized values and `2N` dequantized values before slicing. That can increase temporary work and memory for large odd vectors. The restriction to the exact unsupported rank-one form prevents this cost from affecting normal INT4 DQ graphs. TensorRT's optimizer fused the tested three-node graph into one Myelin engine with zero reported activation memory, but that observation is not a general guarantee for all vector sizes.
+
+### Artifact and tests
+
+```text
+Artifact: C:\Users\amadhavasrir\Downloads\bulding_files\test-env\onnxruntime_providers_nv_tensorrt_rtx.dq-step3-int4-duplicate-slice.dll
+SHA256: 03A47047D5046A213CEEDE1B85AD9251FA196D78026AFA44E9570AA99202043E
+```
+
+The target and six regression controls passed:
+
+```text
+DequantizeLinearOpTest.Int4NoZeroPoint
+DequantizeLinearOpTest.Without_Zero_Point
+DequantizeLinearOpTest.Int8
+DequantizeLinearOpTest.Per_Channel_Axis_Default
+DequantizeLinearOpTest.Per_Channel_Axis_1_int8
+DequantizeLinearContribOpTest.DequantizeLinear_1
+DequantizeLinearContribOpTest.DequantizeLinear_2
+```
+
+The combined run contained zero `Invalid Node` and zero `No graph will run on TensorRT execution provider` messages. Detailed logging for the target showed one Myelin engine with `x (Int4[5]), x_scale (Float[]) -> y (Float[5])`, confirming TensorRT execution rather than CPU fallback.

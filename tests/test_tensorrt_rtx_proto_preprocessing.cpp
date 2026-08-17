@@ -34,6 +34,7 @@ constexpr int32_t kFp16 = onnx::TensorProto_DataType_FLOAT16;
 constexpr int32_t kInt8 = onnx::TensorProto_DataType_INT8;
 constexpr int32_t kUint8 = onnx::TensorProto_DataType_UINT8;
 constexpr int32_t kInt32 = onnx::TensorProto_DataType_INT32;
+constexpr int32_t kInt4 = onnx::TensorProto_DataType_INT4;
 constexpr const char* kOriginalDocString = "42";
 
 onnx::ModelProto MakeModel(int64_t opset_version = 13)
@@ -1084,6 +1085,27 @@ TEST(TensorRTRTXProtoPreprocessingTest, RuntimePerAxisDequantizeLinearLowersToAr
     const auto* output_node = FindNodeByOutput(model.graph(), "y");
     ASSERT_NE(output_node, nullptr);
     EXPECT_EQ(output_node->op_type(), "Mul");
+    EXPECT_EQ(output_node->doc_string(), kOriginalDocString);
+}
+
+TEST(TensorRTRTXProtoPreprocessingTest, OddVolumeInt4WithoutZeroPointDuplicatesAndSlices)
+{
+    auto model = MakeModel(21);
+    auto* graph = model.mutable_graph();
+    model_builder::AddValueInfo(graph->mutable_input(), "x", kInt4, {5});
+    model_builder::AddValueInfo(graph->mutable_input(), "scale", kFp32, {});
+    model_builder::AddValueInfo(graph->mutable_output(), "y", kFp32, {5});
+    auto* dq = model_builder::AddNode(graph, "dq", "DequantizeLinear", {"x", "scale"}, {"y"});
+    dq->set_doc_string(kOriginalDocString);
+
+    trt_rtx_ep::RunTensorRtProtoPreprocessing(model);
+
+    EXPECT_EQ(CountNodes(model.graph(), "Concat"), 1u);
+    EXPECT_EQ(CountNodes(model.graph(), "DequantizeLinear"), 1u);
+    EXPECT_EQ(CountNodes(model.graph(), "Slice"), 1u);
+    const auto* output_node = FindNodeByOutput(model.graph(), "y");
+    ASSERT_NE(output_node, nullptr);
+    EXPECT_EQ(output_node->op_type(), "Slice");
     EXPECT_EQ(output_node->doc_string(), kOriginalDocString);
 }
 
