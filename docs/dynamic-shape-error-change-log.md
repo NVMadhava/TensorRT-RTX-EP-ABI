@@ -728,15 +728,31 @@ Two expected-failure tests remain separate error-propagation issues rather than 
 - `SliceTest.InvalidAxesDuplicates`: TensorRT detected the duplicate axis, but the EP again replaced the detailed error
   with the generic serialized-engine failure.
 
-`SliceTest.EmptyDim` also progressed past profile application but TensorRT failed engine creation for its zero-extent
-input/negative-step forms. This is a zero-extent Slice limitation, not evidence that ordinary Slice parameters must be
-known only at runtime.
+The two `SliceTest.EmptyDim` calls were subsequently isolated. The positive-step zero-extent call passed; only the
+negative-step zero-extent call failed TensorRT engine construction (`starts operand cannot be negative at axis 0`).
 
 ### Conclusion for the runtime-engine count
 
 Slice contributes **zero** tests to the set proven to require runtime engine creation. One prebuilt engine correctly
 handled varying starts, ends, axes, and positive and negative steps when their values were covered by an explicit
-optimization profile. The main 44-test failure pattern is therefore missing automatic shape-tensor value bounds. The two
-invalid-axis tests additionally need detailed error propagation, and `EmptyDim` needs separate zero-extent support or an
-explicit support-policy decision. Runtime engine creation could obtain exact values, but it is not necessary for native
-Slice execution and should not be justified using this family.
+optimization profile. A later exhaustive audit corrected the denominator to 46 failing Slice test instances and showed
+that 42 can execute completely after diagnostic profiles (including sentinel-specialized profiles). The remaining four are one semantic mismatch, one
+test containing a negative-step zero-extent limitation, and two validation/error-propagation cases.
+
+### Exhaustive 46-test follow-up
+
+The full per-input audit is recorded in [slice-failure-audit.md](slice-failure-audit.md). Its important additional
+findings are:
+
+- the 46 failing tests contain 50 distinct Slice input sets;
+- 46/50 input sets execute natively after appropriate profiles or INT64-sentinel handling;
+- a single profile can span positive and negative `steps`, so separate sign profiles are not required;
+- the provider-option parser's `std::stoi` rejects literal INT64 profile values;
+- raw runtime `INT64_MIN/MAX` values overflow under a wide profile, so profiles alone cannot handle sentinel cases;
+- runtime values outside a shape-tensor profile can silently produce results specialized to the profile rather than the
+  supplied value, making runtime profile-range validation a prerequisite for safe automatic profiles;
+- `Slice1D_ReverseAllAxes_1` has an ORT/TensorRT semantic mismatch for negative step plus `INT32_MAX` end.
+
+The resulting implementation order is: runtime range validation, ordinary Slice-aware profiles, runtime sentinel
+normalization, an explicit policy for the reversal semantic mismatch, targeted zero-extent handling, and detailed axes
+validation/error preservation.
