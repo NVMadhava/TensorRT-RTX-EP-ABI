@@ -249,6 +249,9 @@ struct IExecutionContextDeleter
                              std::unique_ptr<nvinfer1::IRuntimeCache>&& runtime_cache,
                              std::unique_ptr<nvinfer1::IRuntimeConfig>&& runtime_config, const OrtApi& ort_api);
 
+    IExecutionContextDeleter(IExecutionContextDeleter&&) noexcept = default;
+    IExecutionContextDeleter& operator=(IExecutionContextDeleter&& other) noexcept;
+
     //! \brief Prevents narrow-string paths from bypassing explicit filesystem path handling.
     IExecutionContextDeleter(const std::string&, std::unique_ptr<nvinfer1::IRuntimeCache>&&,
                              std::unique_ptr<nvinfer1::IRuntimeConfig>&&, const OrtApi&) = delete;
@@ -441,6 +444,9 @@ struct TensorrtRtxComputeState
     std::vector<TensorParams> output_tensors;
     bool is_first_run = true;              //!< Indicates if this is the first run of the engine
     bool skip_io_binding_allowed = false;  //!< Indicates if input/output binding can be skipped
+    bool defer_engine_build = false;       //!< Experimental: build/cache exact profiles from runtime signatures
+    std::unordered_map<std::string, int32_t> runtime_signature_profiles;
+    int32_t runtime_profile_index = 0;
 };
 
 //!
@@ -473,6 +479,8 @@ struct TensorrtRtxExecutionProvider
     : public OrtEp
     , public ApiPtrs
 {
+    friend struct TensorRtRtxEpNodeComputeInfo;
+
     // Constructor - Initialize your EP here
     TensorrtRtxExecutionProvider(TensorrtRtxExecutionProviderFactory& factory, const std::string& name,
                                  const OrtSessionOptions& session_options, const OrtLogger& logger);
@@ -642,6 +650,8 @@ private:
     std::unordered_map<std::string, tensorrt_ptr::unique_pointer_exec_ctx> contexts_;
     std::unordered_map<std::string, std::unique_ptr<nvinfer1::IBuilder>> builders_;
     std::unordered_map<std::string, std::unique_ptr<nvinfer1::INetworkDefinition>> networks_;
+    std::unordered_map<std::string, std::unique_ptr<nvinfer1::IBuilderConfig>> deferred_builder_configs_;
+    std::unordered_map<std::string, tensorrt_ptr::unique_pointer<nvonnxparser::IParser>> deferred_parsers_;
 
     std::unordered_map<std::string, std::vector<std::unordered_map<std::string, size_t>>> input_info_;
     std::unordered_map<std::string, std::vector<std::unordered_map<std::string, size_t>>> output_info_;
@@ -736,6 +746,9 @@ private:
                                              nvinfer1::IBuilderConfig& config,
                                              const char* node_name,
                                              std::unique_ptr<nvinfer1::IHostMemory>& serialized_engine);
+
+    OrtStatus* BuildDeferredEngineForRuntimeSignature(TensorrtRtxComputeState& compute_state,
+                                                      OrtKernelContext* kernel_context, cudaStream_t stream);
 
 public:
     // CUDA Graph related functions

@@ -48,6 +48,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <functional>
@@ -77,6 +78,15 @@
 
 namespace trt_rtx_ep
 {
+
+namespace
+{
+bool RuntimeEngineBuildExperimentEnabled()
+{
+    const char* value = std::getenv("ORT_TRT_RTX_EXPERIMENTAL_RUNTIME_ENGINE_BUILD");
+    return value != nullptr && std::strcmp(value, "1") == 0;
+}
+}  // namespace
 
 const OrtApi* g_ort_api = nullptr;
 const OrtEpApi* g_ep_api = nullptr;
@@ -227,6 +237,17 @@ IExecutionContextDeleter::IExecutionContextDeleter(const std::filesystem::path& 
     , runtime_config_(std::move(runtime_config))
     , ort_api_(ort_api)
 {
+}
+
+IExecutionContextDeleter& IExecutionContextDeleter::operator=(IExecutionContextDeleter&& other) noexcept
+{
+    if (this != &other)
+    {
+        runtime_cache_path_ = std::move(other.runtime_cache_path_);
+        runtime_cache_ = std::move(other.runtime_cache_);
+        runtime_config_ = std::move(other.runtime_config_);
+    }
+    return *this;
 }
 
 void IExecutionContextDeleter::operator()(nvinfer1::IExecutionContext* context) noexcept
@@ -1818,6 +1839,7 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
 
     bool has_dynamic_shape =
         false;  // True if input tensor has dynamic shape and no explicit profile is specified, otherwise false
+    bool defer_engine_build = false;
     if ((!profile_min_shapes_.empty()) && (!profile_max_shapes_.empty()) && (!profile_opt_shapes_.empty()))
     {
         has_explicit_profile = true;
@@ -1847,11 +1869,25 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
             Ort::ThrowOnError(ort_api.Logger_LogMessage(&ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
                                                         message.c_str(), ORT_FILE, __LINE__, __FUNCTION__));
 
-            trt_profiles.push_back(trt_builder->createOptimizationProfile());
+            defer_engine_build = RuntimeEngineBuildExperimentEnabled();
+            if (defer_engine_build)
+            {
+                const std::string deferred_message =
+                    "[NvTensorRTRTX EP][RuntimeEnginePrototype] Deferring engine creation until the first Run() "
+                    "so the optimization profile can use exact runtime input dimensions and shape-tensor values.";
+                Ort::ThrowOnError(ort_api.Logger_LogMessage(&ep->logger_,
+                                                            OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+                                                            deferred_message.c_str(), ORT_FILE, __LINE__,
+                                                            __FUNCTION__));
+            }
+            else
+            {
+                trt_profiles.push_back(trt_builder->createOptimizationProfile());
+            }
         }
     }
 
-    if (has_dynamic_shape)
+    if (has_dynamic_shape && !defer_engine_build)
     {
         // Iterate all input tensors to check dynamic shape
         for (unsigned int i = 0, end = num_inputs; i < end; ++i)
@@ -2061,6 +2097,15 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
                                           std::filesystem::path(ToPathString(model_path_)));
     }
 
+    if (defer_engine_build && (compile_only_mode_ || dump_ep_context_model_))
+    {
+        return ort_api.CreateStatus(
+            ORT_NOT_IMPLEMENTED,
+            "[NvTensorRTRTX EP][RuntimeEnginePrototype] Deferred engine creation does not support compile-only "
+            "or EP-context model generation. Disable ORT_TRT_RTX_EXPERIMENTAL_RUNTIME_ENGINE_BUILD for this use.");
+    }
+
+    if (!defer_engine_build)
     {
         auto lock = GetApiLock();
         // Build engine
@@ -2262,19 +2307,28 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
     // Note: Creating an execution context from an engine is thread safe per TRT doc
     // https://docs.nvidia.com/deeplearning/tensorrt/developer-guide/index.html#threading
 
-    auto trt_context = CreateOwnedExecutionContext(*trt_engine, runtime_cache_file, std::move(trt_runtime_cache),
-                                                   std::move(trt_runtime_config), ep->ort_api);
-    if (!trt_context)
+    tensorrt_ptr::unique_pointer_exec_ctx trt_context{
+        nullptr,
+        tensorrt_ptr::IExecutionContextDeleter(std::filesystem::path{},
+                                               std::unique_ptr<nvinfer1::IRuntimeCache>{},
+                                               std::unique_ptr<nvinfer1::IRuntimeConfig>{}, ep->ort_api)};
+    if (!defer_engine_build)
     {
-        std::string message = "[NvTensorRTRTX EP] NvTensorRTRTX EP could not build execution context for fused node: ";
-        if (node_name != nullptr)
+        trt_context = CreateOwnedExecutionContext(*trt_engine, runtime_cache_file, std::move(trt_runtime_cache),
+                                                  std::move(trt_runtime_config), ep->ort_api);
+        if (!trt_context)
         {
-            message += node_name;
+            std::string message =
+                "[NvTensorRTRTX EP] NvTensorRTRTX EP could not build execution context for fused node: ";
+            if (node_name != nullptr)
+            {
+                message += node_name;
+            }
+            return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
         }
-        return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
     }
 
-    if (ep->profiling_enable_)
+    if (ep->profiling_enable_ && trt_context)
     {
         trt_context->setProfiler(ep->profiler_.get());
         ep->profiler_->SetLayerOnnxMapping(ExtractLayerOnnxMapping(*trt_engine));
@@ -2286,7 +2340,8 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
     {
         auto input = trt_network->getInput(i);
         const std::string& input_name = input->getName();
-        is_dynamic_shape_context |= checkTrtDimIsDynamic(trt_engine->getTensorShape(input_name.c_str()));
+        is_dynamic_shape_context |= trt_engine ? checkTrtDimIsDynamic(trt_engine->getTensorShape(input_name.c_str()))
+                                              : checkTrtTensorIsDynamic(input);
         const auto& iter = input_map.find(input_name);
         if (iter != input_map.end())
         {
@@ -2317,6 +2372,11 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
     output_info_[node_name].push_back(output_types);
     input_shape_ranges_[node_name] = input_implicit_shape_ranges;
     profiles_.emplace(node_name, std::move(trt_profiles));
+    if (defer_engine_build)
+    {
+        deferred_builder_configs_.emplace(node_name, std::move(trt_config));
+        deferred_parsers_.emplace(node_name, std::move(trt_parser));
+    }
 
     auto compute_state = std::make_unique<TensorrtRtxComputeState>();
 
@@ -2353,6 +2413,7 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
         true,   // is_first_run
         false,  // skip_io_binding_allowed
     };
+    compute_state->defer_engine_build = defer_engine_build;
     ep->compute_states_[node_name] = std::move(compute_state);
 
     // Update the OrtNodeComputeInfo associated with the graph.
@@ -3179,16 +3240,20 @@ TensorrtRtxExecutionProvider::~TensorrtRtxExecutionProvider()
     // 2. Destroy engines (they depend on runtime)
     engines_.clear();
 
-    // 3. Destroy networks (they depend on builders)
+    // 3. Deferred parsers/configs may reference networks/builders.
+    deferred_parsers_.clear();
+    deferred_builder_configs_.clear();
+
+    // 4. Destroy networks (they depend on builders)
     networks_.clear();
 
-    // 4. Destroy builders
+    // 5. Destroy builders
     builders_.clear();
 
-    // 5. Destroy the single builder instance
+    // 6. Destroy the single builder instance
     builder_.reset();
 
-    // 6. Destroy runtime last
+    // 7. Destroy runtime last
     trt_rtx_runtime_.reset();
     runtime_.reset();
 
@@ -4948,6 +5013,322 @@ void GetShapeOfShapeTensor(Ort::ConstValue& input_tensor, void* shape_values, in
     CUDA_RETURN_IF_ERROR(cudaStreamSynchronize(stream));
 }
 
+OrtStatus* TensorrtRtxExecutionProvider::BuildDeferredEngineForRuntimeSignature(
+    TensorrtRtxComputeState& compute_state, OrtKernelContext* kernel_context, cudaStream_t stream)
+{
+    const auto config_it = deferred_builder_configs_.find(compute_state.fused_node_name);
+    if (config_it == deferred_builder_configs_.end() || !config_it->second || compute_state.network == nullptr ||
+        !compute_state.network->get() || compute_state.builder == nullptr)
+    {
+        return ort_api.CreateStatus(
+            ORT_EP_FAIL,
+            "[NvTensorRTRTX EP][RuntimeEnginePrototype] Deferred TensorRT build state is incomplete.");
+    }
+
+    auto& config = *config_it->second;
+    auto& network = **compute_state.network;
+    Ort::KernelContext ort_ctx(kernel_context);
+    const auto& input_indexes = compute_state.input_info[0];
+    bool has_shape_tensor = false;
+
+    // Make the cache key from information that can affect the TensorRT engine: every execution-input
+    // dimension and every shape-tensor value. Shape values are copied to the host using the same path
+    // used later for TensorRT input binding.
+    std::ostringstream signature_stream;
+    for (int input_ordinal = 0; input_ordinal < network.getNbInputs(); ++input_ordinal)
+    {
+        auto* network_input = network.getInput(input_ordinal);
+        const std::string input_name = network_input->getName();
+        const auto index_it = input_indexes.find(input_name);
+        if (index_it == input_indexes.end())
+        {
+            return ort_api.CreateStatus(
+                ORT_EP_FAIL,
+                ("[NvTensorRTRTX EP][RuntimeEnginePrototype] ORT input index is missing for TensorRT input '" +
+                 input_name + "'.")
+                    .c_str());
+        }
+
+        auto input_tensor = ort_ctx.GetInput(index_it->second);
+        const auto tensor_info = input_tensor.GetTensorTypeAndShapeInfo();
+        const auto runtime_dims = tensor_info.GetShape();
+        signature_stream << input_name << ":dims=";
+        for (const auto dim : runtime_dims)
+        {
+            signature_stream << dim << ',';
+        }
+
+        if (network_input->isShapeTensor())
+        {
+            const auto element_count = tensor_info.GetElementCount();
+            if (element_count == 0 || element_count > static_cast<size_t>((std::numeric_limits<int32_t>::max)()))
+            {
+                return ort_api.CreateStatus(
+                    ORT_EP_FAIL,
+                    ("[NvTensorRTRTX EP][RuntimeEnginePrototype] Invalid shape-tensor element count for input '" +
+                     input_name + "'.")
+                        .c_str());
+            }
+
+            const int value_count = static_cast<int>(element_count);
+            std::vector<int64_t> values(static_cast<size_t>(value_count));
+            switch (tensor_info.GetElementType())
+            {
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+            {
+                std::vector<int32_t> source(static_cast<size_t>(value_count));
+                GetShapeOfShapeTensor<int32_t>(input_tensor, source.data(), value_count, stream);
+                std::transform(source.begin(), source.end(), values.begin(),
+                               [](int32_t value) { return static_cast<int64_t>(value); });
+                break;
+            }
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+                GetShapeOfShapeTensor<int64_t>(input_tensor, values.data(), value_count, stream);
+                break;
+            default:
+                return ort_api.CreateStatus(
+                    ORT_EP_FAIL,
+                    ("[NvTensorRTRTX EP][RuntimeEnginePrototype] Shape-tensor input '" + input_name +
+                     "' must contain int32 or int64 values.")
+                        .c_str());
+            }
+            signature_stream << ":values=";
+            for (const auto value : values)
+            {
+                signature_stream << value << ',';
+            }
+        }
+        signature_stream << ';';
+    }
+
+    const std::string runtime_signature = signature_stream.str();
+    if (const auto cached = compute_state.runtime_signature_profiles.find(runtime_signature);
+        cached != compute_state.runtime_signature_profiles.end())
+    {
+        compute_state.runtime_profile_index = cached->second;
+        return nullptr;
+    }
+
+    auto profile = compute_state.builder->createOptimizationProfile();
+    if (profile == nullptr)
+    {
+        return ort_api.CreateStatus(
+            ORT_EP_FAIL,
+            "[NvTensorRTRTX EP][RuntimeEnginePrototype] createOptimizationProfile returned null.");
+    }
+
+    for (int input_ordinal = 0; input_ordinal < network.getNbInputs(); ++input_ordinal)
+    {
+        auto* network_input = network.getInput(input_ordinal);
+        const std::string input_name = network_input->getName();
+        const auto index_it = input_indexes.find(input_name);
+        if (index_it == input_indexes.end())
+        {
+            return ort_api.CreateStatus(
+                ORT_EP_FAIL,
+                ("[NvTensorRTRTX EP][RuntimeEnginePrototype] ORT input index is missing for TensorRT input '" +
+                 input_name + "'.")
+                    .c_str());
+        }
+
+        auto input_tensor = ort_ctx.GetInput(index_it->second);
+        const auto tensor_info = input_tensor.GetTensorTypeAndShapeInfo();
+        const auto runtime_dims = tensor_info.GetShape();
+
+        if (network_input->isShapeTensor())
+        {
+            has_shape_tensor = true;
+            const auto element_count = tensor_info.GetElementCount();
+            if (element_count <= 0 || element_count > static_cast<size_t>((std::numeric_limits<int32_t>::max)()))
+            {
+                return ort_api.CreateStatus(
+                    ORT_EP_FAIL,
+                    ("[NvTensorRTRTX EP][RuntimeEnginePrototype] Invalid shape-tensor element count for input '" +
+                     input_name + "'.")
+                        .c_str());
+            }
+
+            const int value_count = static_cast<int>(element_count);
+            std::vector<int64_t> values(static_cast<size_t>(value_count));
+            switch (tensor_info.GetElementType())
+            {
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32:
+            {
+                std::vector<int32_t> source(static_cast<size_t>(value_count));
+                GetShapeOfShapeTensor<int32_t>(input_tensor, source.data(), value_count, stream);
+                std::transform(source.begin(), source.end(), values.begin(),
+                               [](int32_t value) { return static_cast<int64_t>(value); });
+                break;
+            }
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64:
+                GetShapeOfShapeTensor<int64_t>(input_tensor, values.data(), value_count, stream);
+                break;
+            default:
+                return ort_api.CreateStatus(
+                    ORT_EP_FAIL,
+                    ("[NvTensorRTRTX EP][RuntimeEnginePrototype] Shape-tensor input '" + input_name +
+                     "' must contain int32 or int64 values.")
+                        .c_str());
+            }
+
+            const bool min_ok = profile->setShapeValuesV2(input_name.c_str(), nvinfer1::OptProfileSelector::kMIN,
+                                                           values.data(), value_count);
+            const bool opt_ok = profile->setShapeValuesV2(input_name.c_str(), nvinfer1::OptProfileSelector::kOPT,
+                                                           values.data(), value_count);
+            const bool max_ok = profile->setShapeValuesV2(input_name.c_str(), nvinfer1::OptProfileSelector::kMAX,
+                                                           values.data(), value_count);
+            if (!min_ok || !opt_ok || !max_ok)
+            {
+                return ort_api.CreateStatus(
+                    ORT_EP_FAIL,
+                    ("[NvTensorRTRTX EP][RuntimeEnginePrototype] TensorRT rejected exact runtime values for shape "
+                     "input '" +
+                     input_name + "'.")
+                        .c_str());
+            }
+
+            std::ostringstream values_message;
+            values_message << "[NvTensorRTRTX EP][RuntimeEnginePrototype] Exact shape values: input='" << input_name
+                           << "', values=[";
+            for (size_t i = 0; i < values.size(); ++i)
+            {
+                if (i != 0)
+                {
+                    values_message << ',';
+                }
+                values_message << values[i];
+            }
+            values_message << "]";
+            Ort::ThrowOnError(ort_api.Logger_LogMessage(&logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+                                                        values_message.str().c_str(), ORT_FILE, __LINE__,
+                                                        __FUNCTION__));
+        }
+        else
+        {
+            if (runtime_dims.size() > static_cast<size_t>(nvinfer1::Dims::MAX_DIMS))
+            {
+                return ort_api.CreateStatus(
+                    ORT_EP_FAIL,
+                    ("[NvTensorRTRTX EP][RuntimeEnginePrototype] Runtime rank exceeds TensorRT's limit for input '" +
+                     input_name + "'.")
+                        .c_str());
+            }
+
+            nvinfer1::Dims exact_dims{};
+            exact_dims.nbDims = static_cast<int32_t>(runtime_dims.size());
+            for (int dim = 0; dim < exact_dims.nbDims; ++dim)
+            {
+                if (runtime_dims[dim] < 0 || runtime_dims[dim] > (std::numeric_limits<int32_t>::max)())
+                {
+                    return ort_api.CreateStatus(
+                        ORT_EP_FAIL,
+                        ("[NvTensorRTRTX EP][RuntimeEnginePrototype] Runtime dimension is outside TensorRT's range "
+                         "for input '" +
+                         input_name + "'.")
+                            .c_str());
+                }
+                exact_dims.d[dim] = static_cast<int32_t>(runtime_dims[dim]);
+            }
+
+            const bool min_ok = profile->setDimensions(input_name.c_str(), nvinfer1::OptProfileSelector::kMIN,
+                                                        exact_dims);
+            const bool opt_ok = profile->setDimensions(input_name.c_str(), nvinfer1::OptProfileSelector::kOPT,
+                                                        exact_dims);
+            const bool max_ok = profile->setDimensions(input_name.c_str(), nvinfer1::OptProfileSelector::kMAX,
+                                                        exact_dims);
+            if (!min_ok || !opt_ok || !max_ok)
+            {
+                return ort_api.CreateStatus(
+                    ORT_EP_FAIL,
+                    ("[NvTensorRTRTX EP][RuntimeEnginePrototype] TensorRT rejected exact runtime dimensions for "
+                     "input '" +
+                     input_name + "'.")
+                        .c_str());
+            }
+        }
+    }
+
+    const int32_t profile_index = profile->isValid() ? config.addOptimizationProfile(profile) : -1;
+    if (profile_index < 0)
+    {
+        return ort_api.CreateStatus(
+            ORT_EP_FAIL,
+            "[NvTensorRTRTX EP][RuntimeEnginePrototype] Exact runtime optimization profile is invalid.");
+    }
+
+    if (has_shape_tensor && cuda_graph_enable_)
+    {
+        cuda_graph_enable_ = false;
+        compute_state.cuda_graph_enable = false;
+        Ort::ThrowOnError(ort_api.Logger_LogMessage(
+            &logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+            "[NvTensorRTRTX EP][RuntimeEnginePrototype] Shape tensor detected; disabling CUDA Graph.", ORT_FILE,
+            __LINE__, __FUNCTION__));
+    }
+
+    std::unique_ptr<nvinfer1::IHostMemory> serialized_engine;
+    {
+        auto api_lock = GetApiLock();
+        RETURN_IF_ERROR(BuildSerializedNetworkForNode(*compute_state.builder, network, config,
+                                                      compute_state.fused_node_name.c_str(), serialized_engine));
+    }
+
+    auto engine = std::unique_ptr<nvinfer1::ICudaEngine>(
+        compute_state.runtime->deserializeCudaEngine(serialized_engine->data(), serialized_engine->size()));
+    if (!engine)
+    {
+        return ort_api.CreateStatus(
+            ORT_EP_FAIL,
+            "[NvTensorRTRTX EP][RuntimeEnginePrototype] Failed to deserialize the first-run engine.");
+    }
+
+    RETURN_IF_ERROR(ApplyWeightStreamingBudget(*engine, weight_streaming_budget_, compute_state.fused_node_name,
+                                               logger_, ort_api));
+
+    auto runtime_config = std::unique_ptr<nvinfer1::IRuntimeConfig>(engine->createRuntimeConfig());
+    if (!runtime_config)
+    {
+        return ort_api.CreateStatus(
+            ORT_EP_FAIL,
+            "[NvTensorRTRTX EP][RuntimeEnginePrototype] createRuntimeConfig returned null.");
+    }
+    runtime_config->setExecutionContextAllocationStrategy(
+        nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED);
+
+    auto context = CreateOwnedExecutionContext(*engine, std::filesystem::path{},
+                                               std::unique_ptr<nvinfer1::IRuntimeCache>{},
+                                               std::move(runtime_config), ort_api);
+    if (!context)
+    {
+        return ort_api.CreateStatus(
+            ORT_EP_FAIL,
+            "[NvTensorRTRTX EP][RuntimeEnginePrototype] Failed to create the first-run execution context.");
+    }
+
+    if (profiling_enable_)
+    {
+        context->setProfiler(profiler_.get());
+        profiler_->SetLayerOnnxMapping(ExtractLayerOnnxMapping(*engine));
+    }
+
+    // The old execution context must be destroyed before replacing its engine. TensorRT keeps a
+    // context counter in the engine and reports undefined behavior if this order is reversed.
+    compute_state.context->reset();
+    *compute_state.engine = std::move(engine);
+    *compute_state.context = std::move(context);
+    compute_state.profiles.push_back(profile);
+    compute_state.runtime_signature_profiles.emplace(runtime_signature, profile_index);
+    compute_state.runtime_profile_index = profile_index;
+
+    Ort::ThrowOnError(ort_api.Logger_LogMessage(
+        &logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+        ("[NvTensorRTRTX EP][RuntimeEnginePrototype] Built exact-profile engine for runtime signature " +
+         std::to_string(profile_index) + " on fused node '" + compute_state.fused_node_name + "'.")
+            .c_str(),
+        ORT_FILE, __LINE__, __FUNCTION__));
+    return nullptr;
+}
+
 #define CASE_GET_INPUT_TENSOR(DATA_TYPE, SrcT)                                        \
     case DATA_TYPE:                                                                   \
     {                                                                                 \
@@ -5538,17 +5919,37 @@ OrtStatus* TensorRtRtxEpNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* this_pt
     }
     ScopedCudaContext compute_stream_context(ep.compute_stream_context_);
 
-    if (compute_state_ptr->multi_profile_enable == true)
+    if (compute_state_ptr->defer_engine_build)
     {
-        if (!trt_context->setOptimizationProfileAsync(compute_state_ptr->trt_profile_index_, stream))
-            return ep.ort_api.CreateStatus(
-                ORT_EP_FAIL, "NvTensorRTRTX EP select an optimization profile for the current context failed");
+        RETURN_IF_ERROR(ep.BuildDeferredEngineForRuntimeSignature(*compute_state_ptr, kernel_context, stream));
+        trt_engine = compute_state_ptr->engine->get();
+        trt_context = compute_state_ptr->context->get();
     }
 
     // Check before using trt_engine
     if (trt_engine == nullptr)
     {
         return ep.ort_api.CreateStatus(ORT_EP_FAIL, "No engine is found.");
+    }
+    if (trt_context == nullptr)
+    {
+        return ep.ort_api.CreateStatus(ORT_EP_FAIL, "No execution context is found.");
+    }
+
+    if (compute_state_ptr->defer_engine_build)
+    {
+        if (!trt_context->setOptimizationProfileAsync(compute_state_ptr->runtime_profile_index, stream))
+        {
+            return ep.ort_api.CreateStatus(
+                ORT_EP_FAIL,
+                "[NvTensorRTRTX EP][RuntimeEnginePrototype] Failed to select the runtime-signature profile.");
+        }
+    }
+    else if (compute_state_ptr->multi_profile_enable == true)
+    {
+        if (!trt_context->setOptimizationProfileAsync(compute_state_ptr->trt_profile_index_, stream))
+            return ep.ort_api.CreateStatus(
+                ORT_EP_FAIL, "NvTensorRTRTX EP select an optimization profile for the current context failed");
     }
 
     bool require_io_binding = IsIOBindingRequired(compute_state_ptr, kernel_context);
