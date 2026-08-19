@@ -678,3 +678,65 @@ not use runtime `axes`. Static input/output shapes could produce bounded profile
 doing so would implicitly exclude other ONNX-valid negative values that the same model could receive at runtime. This is
 therefore a possible deliberately scoped policy/prototype, not yet a generally correct Pad implementation. No provider
 code change has been made pending review of that semantic tradeoff.
+
+## Slice runtime-profile feasibility investigation
+
+### Scope and failure inventory
+
+No provider source behavior was changed. The final 464-failure inventory contains 44 `SliceTest` failures. Slice opset
+10+ supplies `starts`, `ends`, optional `axes`, and optional `steps` as graph inputs. In the ORT test helper, each normal
+case is exercised first with these parameters as runtime inputs and then with them as initializers. The runtime form fails
+during session initialization because the current implicit profile copies each parameter tensor's container dimension
+(normally `[1]`) rather than supplying bounds for its values.
+
+`SliceTest.Slice1D_Regular` was used as the provider-test control. It failed without explicit profiles and passed with the
+exact runtime values `starts=[2]`, `ends=[4]`, and `axes=[0]`. Exact profiles also made the following representative tests
+pass:
+
+- `SliceTest.Slice2D_TwoAxes` with two-element `starts`, `ends`, and `axes`;
+- `SliceTest.Slice1D_WithNegativeSteps_Regular` with negative bounds and `steps=[-1]`;
+- `SliceTest.Slice1D_EndOutOfBounds` with `ends=[10]` for a six-element input;
+- `SliceTest.Slice1D_InvalidStartEndRange`, which correctly produced an empty output;
+- `SliceTest.OptionalAxesInputAloneMissing`, where `steps` is present but `axes` is omitted.
+
+### Same-engine runtime-value matrix
+
+An isolated runner and two small models were placed under the untracked directory
+`build-phase1-ninja\slice-profile-experiment`. CPU fallback was disabled. Each variable-profile experiment created one
+session and reused its single TensorRT engine for all listed runtime values. All 23 custom inference executions passed:
+
+| Parameter under test | Values exercised in one engine | Result |
+|---|---|---|
+| `ends` | `2`, `4`, `6` with `starts=0` | 3/3 passed with output lengths 2, 4, and 6 |
+| `starts` | `0`, `1`, `3` with `ends=6` | 3/3 passed with output lengths 6, 5, and 3 |
+| `axes` | `0`, `1` on a rank-2 input | 6/6 passed across two fixed controls, a full-slice variable pair, and a distinct-output variable pair |
+| positive `steps` | `1`, `2` | 2/2 variable-profile runs passed; both fixed controls also passed |
+| negative `steps` | `-2`, `-1` | 2/2 variable-profile runs passed; both fixed controls also passed |
+| negative bounds | `starts=-4`, `ends=-1` | passed |
+| out-of-bounds bounds | `starts=-100`, `ends=100` | passed and clamped correctly |
+
+The distinct-output axis control used the same session with `starts=1` and `ends=2`. Runtime `axis=0` produced shape
+`[1,3]` and values `[3,4,5]`; runtime `axis=1` produced shape `[2,1]` and values `[1,4]`. This proves that the second axis
+value was consumed at execution and was not merely ignored by an engine specialized for the first axis.
+
+### Edge cases exposed after profiles were supplied
+
+Two expected-failure tests remain separate error-propagation issues rather than runtime-profile restrictions:
+
+- `SliceTest.InvalidAxesOutOfBounds`: TensorRT rejected axis 2 for a rank-2 tensor, but the EP returned only the generic
+  serialized-engine failure instead of ORT's expected `axis outside of the tensor dimension count` text.
+- `SliceTest.InvalidAxesDuplicates`: TensorRT detected the duplicate axis, but the EP again replaced the detailed error
+  with the generic serialized-engine failure.
+
+`SliceTest.EmptyDim` also progressed past profile application but TensorRT failed engine creation for its zero-extent
+input/negative-step forms. This is a zero-extent Slice limitation, not evidence that ordinary Slice parameters must be
+known only at runtime.
+
+### Conclusion for the runtime-engine count
+
+Slice contributes **zero** tests to the set proven to require runtime engine creation. One prebuilt engine correctly
+handled varying starts, ends, axes, and positive and negative steps when their values were covered by an explicit
+optimization profile. The main 44-test failure pattern is therefore missing automatic shape-tensor value bounds. The two
+invalid-axis tests additionally need detailed error propagation, and `EmptyDim` needs separate zero-extent support or an
+explicit support-policy decision. Runtime engine creation could obtain exact values, but it is not necessary for native
+Slice execution and should not be justified using this family.
