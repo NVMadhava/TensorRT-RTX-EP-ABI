@@ -756,3 +756,12 @@ findings are:
 The resulting implementation order is: runtime range validation, ordinary Slice-aware profiles, runtime sentinel
 normalization, an explicit policy for the reversal semantic mismatch, targeted zero-extent handling, and detailed axes
 validation/error preservation.
+
+## Experimental runtime engine creation
+
+A separate disposable branch, `codex/runtime-engine-prototype`, tested delaying engine serialization until runtime values
+are available. The implementation, focused validation, full 5,533-test comparison, limitations, and recommendation are
+recorded in [runtime-engine-prototype-findings.md](runtime-engine-prototype-findings.md). The headline result was a drop
+from 464 to 183 failures without CPU fallback: 284 original failures passed, 180 remained, and 3 previously masked Tile
+overflow-validation failures became visible. This experiment is evidence for design discussion and is not part of the
+main DQ change set.
