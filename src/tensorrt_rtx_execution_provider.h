@@ -731,6 +731,12 @@ private:
 
     nvinfer1::IBuilder* GetBuilder(TensorrtRtxLogger& trt_logger) const;
 
+    OrtStatus* BuildSerializedNetworkForNode(nvinfer1::IBuilder& builder,
+                                             nvinfer1::INetworkDefinition& network,
+                                             nvinfer1::IBuilderConfig& config,
+                                             const char* node_name,
+                                             std::unique_ptr<nvinfer1::IHostMemory>& serialized_engine);
+
 public:
     // CUDA Graph related functions
     void HandleCudaGraphStart(cudaStream_t stream, bool require_io_binding,

@@ -1324,6 +1324,55 @@ nvinfer1::IBuilder* TensorrtRtxExecutionProvider::GetBuilder(TensorrtRtxLogger& 
     return builder_.get();
 }
 
+OrtStatus* TensorrtRtxExecutionProvider::BuildSerializedNetworkForNode(
+    nvinfer1::IBuilder& builder, nvinfer1::INetworkDefinition& network, nvinfer1::IBuilderConfig& config,
+    const char* node_name, std::unique_ptr<nvinfer1::IHostMemory>& serialized_engine)
+{
+    serialized_engine.reset(builder.buildSerializedNetwork(network, config));
+    if (serialized_engine != nullptr)
+    {
+        return nullptr;
+    }
+
+    std::string message = "[NvTensorRTRTX EP] Failed to create serialized engine for fused node: ";
+    if (node_name != nullptr)
+    {
+        message += node_name;
+    }
+
+    // Weightless SDK-support guard, PART 3 (runtime handling): a weight-stripped (kSTRIP_PLAN)
+    // build can fail here for two very different reasons -- a genuine per-GPU-arch weight-strip
+    // capability gap (a Myelin functional floor, e.g. sm_120 / RTX 50-series -> TensorRT-RTX >=
+    // 1.6.1.106) OR an environmental CUDA failure unrelated to weight-strip (e.g. CUDA-in-Graphics
+    // / D3D12-Vulkan interop, where cudaMallocAsync can fail). We cannot tell them apart from the
+    // TRT error, so report the DETECTED environment (compute capability + runtime version) and
+    // only point at the sm_120 floor when actually on sm_120; otherwise point at the environmental
+    // path. (getInferLibVersion() exposes only MAJOR.MINOR.PATCH, not the build number, so we
+    // report the version and name the floor rather than auto-deciding the exact 1.6.1.106 build.)
+    if (weight_stripped_engine_enable_)
+    {
+        const int v = trt_version_;
+        const std::string trt_ver =
+            std::to_string(v / 10000) + "." + std::to_string((v / 100) % 100) + "." + std::to_string(v % 100);
+        message += ". Weight-stripped (kSTRIP_PLAN) build failed. Detected GPU compute capability sm_" +
+                   compute_capability_ + ", TensorRT-RTX runtime " + trt_ver +
+                   " (build/patch number not reported by the runtime API).";
+        if (compute_capability_ == "120")
+        {
+            message += " Weight-stripping on sm_120 (Blackwell / RTX 50-series) requires TensorRT-RTX "
+                       ">= 1.6.1.106 -- verify the installed version meets this floor.";
+        }
+        else
+        {
+            message += " If this GPU/SDK is expected to support weight-stripping, the failure may be "
+                       "environmental (e.g. CUDA-in-Graphics / D3D12-Vulkan interop, where "
+                       "cudaMallocAsync can fail) -- try nv_use_sync_gpu_allocator=1.";
+        }
+    }
+
+    return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
+}
+
 Ort::Graph TensorrtRtxExecutionProvider::GetSubgraph(SubGraph_t graph_nodes_index, const Ort::ConstGraph& graph) const
 {
 
@@ -2021,46 +2070,9 @@ OrtStatus* TensorrtRtxExecutionProvider::CreateNodeComputeInfoFromGraph(
             engine_build_start = std::chrono::steady_clock::now();
         }
 
-        std::unique_ptr<nvinfer1::IHostMemory> serialized_engine{
-            trt_builder->buildSerializedNetwork(*trt_network, *trt_config)};
-        if (serialized_engine == nullptr)
-        {
-            std::string message = "[NvTensorRTRTX EP] Failed to create serialized engine for fused node: ";
-            if (node_name != nullptr)
-            {
-                message += node_name;
-            }
-            // Weightless SDK-support guard, PART 3 (runtime handling): a weight-stripped (kSTRIP_PLAN)
-            // build can fail here for two very different reasons -- a genuine per-GPU-arch weight-strip
-            // capability gap (a Myelin functional floor, e.g. sm_120 / RTX 50-series -> TensorRT-RTX >=
-            // 1.6.1.106) OR an environmental CUDA failure unrelated to weight-strip (e.g. CUDA-in-Graphics
-            // / D3D12-Vulkan interop, where cudaMallocAsync can fail). We cannot tell them apart from the
-            // TRT error, so report the DETECTED environment (compute capability + runtime version) and
-            // only point at the sm_120 floor when actually on sm_120; otherwise point at the environmental
-            // path. (getInferLibVersion() exposes only MAJOR.MINOR.PATCH, not the build number, so we
-            // report the version and name the floor rather than auto-deciding the exact 1.6.1.106 build.)
-            if (weight_stripped_engine_enable_)
-            {
-                const int v = trt_version_;
-                const std::string trt_ver =
-                    std::to_string(v / 10000) + "." + std::to_string((v / 100) % 100) + "." + std::to_string(v % 100);
-                message += ". Weight-stripped (kSTRIP_PLAN) build failed. Detected GPU compute capability sm_" +
-                           compute_capability_ + ", TensorRT-RTX runtime " + trt_ver +
-                           " (build/patch number not reported by the runtime API).";
-                if (compute_capability_ == "120")
-                {
-                    message += " Weight-stripping on sm_120 (Blackwell / RTX 50-series) requires TensorRT-RTX "
-                               ">= 1.6.1.106 -- verify the installed version meets this floor.";
-                }
-                else
-                {
-                    message += " If this GPU/SDK is expected to support weight-stripping, the failure may be "
-                               "environmental (e.g. CUDA-in-Graphics / D3D12-Vulkan interop, where "
-                               "cudaMallocAsync can fail) -- try nv_use_sync_gpu_allocator=1.";
-                }
-            }
-            return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
-        }
+        std::unique_ptr<nvinfer1::IHostMemory> serialized_engine;
+        RETURN_IF_ERROR(ep->BuildSerializedNetworkForNode(*trt_builder, *trt_network, *trt_config, node_name,
+                                                          serialized_engine));
 
         std::string engine_id;
         // Capture engine header (first 64 bytes) for compatibility validation
