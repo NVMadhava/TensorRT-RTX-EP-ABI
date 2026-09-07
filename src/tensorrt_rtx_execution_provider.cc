@@ -3268,23 +3268,23 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
                 return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
             }
 
+            // Check the element type regardless of rank. Scalar (rank-0) tensors are
+            // still real tensors with a data type, so gating this on a non-zero
+            // dimension count would let unsupported scalar types through.
             auto ts_info = tp.GetTensorTypeAndShapeInfo();
-            if (ts_info.GetDimensionsCount() > 0)
+            auto data_type = ts_info.GetElementType();
+            if (!IsSupportedInputOutputDataType(data_type))
             {
-                auto data_type = ts_info.GetElementType();
-                if (!IsSupportedInputOutputDataType(data_type))
+                std::string message = "[NvTensorRTRTX EP] Unsupported data type " + GetDataTypeName(data_type) +
+                                      " for input node: " + input.GetName();
+                OrtStatus* log_status =
+                    ort_api.Logger_LogMessage(&ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+                                              message.c_str(), ORT_FILE, __LINE__, __FUNCTION__);
+                if (log_status)
                 {
-                    std::string message = "[NvTensorRTRTX EP] Unsupported data type " + GetDataTypeName(data_type) +
-                                          " for input node: " + input.GetName();
-                    OrtStatus* log_status =
-                        ort_api.Logger_LogMessage(&ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
-                                                  message.c_str(), ORT_FILE, __LINE__, __FUNCTION__);
-                    if (log_status)
-                    {
-                        ort_api.ReleaseStatus(log_status);
-                    }
-                    return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
+                    ort_api.ReleaseStatus(log_status);
                 }
+                return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
             }
         }
     }
@@ -3308,23 +3308,23 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
                 ;
             }
 
+            // Check the element type regardless of rank. Scalar (rank-0) tensors are
+            // still real tensors with a data type, so gating this on a non-zero
+            // dimension count would let unsupported scalar types through.
             auto ts_info = tp.GetTensorTypeAndShapeInfo();
-            if (ts_info.GetDimensionsCount() > 0)
+            auto data_type = ts_info.GetElementType();
+            if (!IsSupportedInputOutputDataType(data_type))
             {
-                auto data_type = ts_info.GetElementType();
-                if (!IsSupportedInputOutputDataType(data_type))
+                std::string message = "[NvTensorRTRTX EP] Unsupported data type " + GetDataTypeName(data_type) +
+                                      " for output node: " + output.GetName();
+                OrtStatus* log_status =
+                    ort_api.Logger_LogMessage(&ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
+                                              message.c_str(), ORT_FILE, __LINE__, __FUNCTION__);
+                if (log_status)
                 {
-                    std::string message = "[NvTensorRTRTX EP] Unsupported data type " + GetDataTypeName(data_type) +
-                                          " for output node: " + output.GetName();
-                    OrtStatus* log_status =
-                        ort_api.Logger_LogMessage(&ep->logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
-                                                  message.c_str(), ORT_FILE, __LINE__, __FUNCTION__);
-                    if (log_status)
-                    {
-                        ort_api.ReleaseStatus(log_status);
-                    }
-                    return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
+                    ort_api.ReleaseStatus(log_status);
                 }
+                return ort_api.CreateStatus(ORT_EP_FAIL, message.c_str());
             }
         }
     }
