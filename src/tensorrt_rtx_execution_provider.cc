@@ -2697,7 +2697,7 @@ TensorrtRtxExecutionProvider::TensorrtRtxExecutionProvider(TensorrtRtxExecutionP
     else
     {
         external_stream_ = false;
-        CUDA_CALL_THROW(cudaStreamCreate(&stream_));
+        CUDA_CALL_THROW(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
     }
     compute_stream_context_ = GetCudaStreamContextOrThrow(stream_);
     if (external_stream_ && compute_stream_context_ == nullptr)
@@ -5546,7 +5546,10 @@ OrtStatus* TensorRtRtxEpNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* this_pt
     }
 
     // Set execution context memory
-    AllocatorUniquePtr<void> context_memory;
+    AllocatorUniquePtr<void> transient_context_memory;
+    const bool persistent_context_memory = ep.IsPersistentContextMemoryEnabled();
+    auto& context_memory =
+        persistent_context_memory ? compute_state_ptr->execution_context_memory : transient_context_memory;
 
     {
         size_t mem_size = trt_engine->getDeviceMemorySizeV2();
@@ -5554,7 +5557,9 @@ OrtStatus* TensorRtRtxEpNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* this_pt
         {
             mem_size = trt_context->updateDeviceMemorySizeForShapes();
         }
-        if (mem_size > 0)
+        // Persistent storage covers all shapes; transient storage only covers this run.
+        const size_t allocation_size = persistent_context_memory ? trt_engine->getDeviceMemorySizeV2() : mem_size;
+        if (mem_size > 0 && !context_memory)
         {
             const uint32_t device_id = static_cast<uint32_t>(compute_state_ptr->device_id);
             // When the synchronous GPU allocator is enabled, skip the async mempool
@@ -5564,7 +5569,7 @@ OrtStatus* TensorRtRtxEpNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* this_pt
                 ep.IsSyncGpuAllocatorEnabled() ? nullptr : ep.factory_.GetActiveMempoolForDevice(device_id);
             if (mempool != nullptr)
             {
-                context_memory = MakeUniquePtrFromCudaMempool<void>(mempool, mem_size, stream);
+                context_memory = MakeUniquePtrFromCudaMempool<void>(mempool, allocation_size, stream);
                 if (!context_memory)
                 {
                     // Runtime async OOM (VA fragmented after the create probe).
@@ -5572,19 +5577,22 @@ OrtStatus* TensorRtRtxEpNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* this_pt
                     // (Once ORT-level graph capture is wired into compute, a captured
                     // graph holding a pool pointer must be evicted when the latch trips.)
                     ep.factory_.NoteAsyncMempoolFailure(device_id);
-                    context_memory = MakeUniquePtrFromOrtAllocator<void>(alloc, mem_size, stream);
+                    context_memory = MakeUniquePtrFromOrtAllocator<void>(alloc, allocation_size, stream);
                 }
             }
             else
             {
-                context_memory = MakeUniquePtrFromOrtAllocator<void>(alloc, mem_size, stream);
+                context_memory = MakeUniquePtrFromOrtAllocator<void>(alloc, allocation_size, stream);
             }
             if (!context_memory)
             {
-                std::string error_msg = "Failed to allocate device memory of size " + std::to_string(mem_size) +
+                std::string error_msg = "Failed to allocate device memory of size " + std::to_string(allocation_size) +
                                         " for TensorRT execution context.";
                 return g_ort_api->CreateStatus(OrtErrorCode::ORT_EP_FAIL, error_msg.c_str());
             }
+        }
+        if (mem_size > 0)
+        {
             trt_context->setDeviceMemoryV2(context_memory.get(), mem_size);
         }
     }
@@ -5924,7 +5932,9 @@ OrtStatus* TensorRtRtxEpContextNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* 
     }
 
     // Set execution context memory
-    AllocatorUniquePtr<void> context_memory;
+    AllocatorUniquePtr<void> transient_context_memory;
+    const bool persistent_context_memory = ep.IsPersistentContextMemoryEnabled();
+    auto& context_memory = persistent_context_memory ? trt_state->execution_context_memory : transient_context_memory;
 
     {
         size_t mem_size = trt_engine->getDeviceMemorySizeV2();
@@ -5932,7 +5942,9 @@ OrtStatus* TensorRtRtxEpContextNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* 
         {
             mem_size = trt_context->updateDeviceMemorySizeForShapes();
         }
-        if (mem_size > 0)
+        // Persistent storage covers all shapes; transient storage only covers this run.
+        const size_t allocation_size = persistent_context_memory ? trt_engine->getDeviceMemorySizeV2() : mem_size;
+        if (mem_size > 0 && !context_memory)
         {
             const uint32_t device_id = static_cast<uint32_t>(trt_state->device_id);
             // When the synchronous GPU allocator is enabled, skip the async mempool
@@ -5942,7 +5954,7 @@ OrtStatus* TensorRtRtxEpContextNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* 
                 ep.IsSyncGpuAllocatorEnabled() ? nullptr : ep.factory_.GetActiveMempoolForDevice(device_id);
             if (mempool != nullptr)
             {
-                context_memory = MakeUniquePtrFromCudaMempool<void>(mempool, mem_size, stream);
+                context_memory = MakeUniquePtrFromCudaMempool<void>(mempool, allocation_size, stream);
                 if (!context_memory)
                 {
                     // Runtime async OOM (VA fragmented after the create probe).
@@ -5950,19 +5962,22 @@ OrtStatus* TensorRtRtxEpContextNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* 
                     // (Once ORT-level graph capture is wired into compute, a captured
                     // graph holding a pool pointer must be evicted when the latch trips.)
                     ep.factory_.NoteAsyncMempoolFailure(device_id);
-                    context_memory = MakeUniquePtrFromOrtAllocator<void>(alloc, mem_size, stream);
+                    context_memory = MakeUniquePtrFromOrtAllocator<void>(alloc, allocation_size, stream);
                 }
             }
             else
             {
-                context_memory = MakeUniquePtrFromOrtAllocator<void>(alloc, mem_size, stream);
+                context_memory = MakeUniquePtrFromOrtAllocator<void>(alloc, allocation_size, stream);
             }
             if (!context_memory)
             {
-                std::string error_msg = "Failed to allocate device memory of size " + std::to_string(mem_size) +
+                std::string error_msg = "Failed to allocate device memory of size " + std::to_string(allocation_size) +
                                         " for TensorRT execution context.";
                 return g_ort_api->CreateStatus(OrtErrorCode::ORT_EP_FAIL, error_msg.c_str());
             }
+        }
+        if (mem_size > 0)
+        {
             trt_context->setDeviceMemoryV2(context_memory.get(), mem_size);
         }
     }

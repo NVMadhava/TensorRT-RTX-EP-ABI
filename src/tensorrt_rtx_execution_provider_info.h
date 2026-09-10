@@ -71,6 +71,7 @@ struct TensorrtRtxExecutionProviderInfo
     // runtime/builder via setGpuAllocator, bypassing TRT RTX's default cudaMallocAsync path.
     // Defaults to false to preserve current (async) behavior.
     bool use_sync_gpu_allocator{false};
+    bool persistent_context_memory{false};
     int64_t multi_rotary_cache_concat_offset{0};
 
     static TensorrtRtxExecutionProviderInfo FromProviderOptions(const ProviderOptions& options);
