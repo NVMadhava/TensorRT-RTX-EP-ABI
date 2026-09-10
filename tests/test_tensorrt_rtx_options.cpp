@@ -407,6 +407,37 @@ TEST(TensorRTRTXEpTest_Options, RuntimeCacheWriteFailureDoesNotEscapeTeardown)
     std::filesystem::remove(runtime_cache_dir);
 }
 
+TEST(TensorRTRTXEpTest_Options, PersistentContextMemoryOption)
+{
+    EXPECT_FALSE(TensorrtRtxExecutionProviderInfo::FromProviderOptions({}).persistent_context_memory);
+    EXPECT_FALSE(TensorrtRtxExecutionProviderInfo::FromProviderOptions({{"nv_persistent_context_memory", "0"}})
+                     .persistent_context_memory);
+    EXPECT_TRUE(TensorrtRtxExecutionProviderInfo::FromProviderOptions({{"nv_persistent_context_memory", "1"}})
+                    .persistent_context_memory);
+    EXPECT_THROW(
+        (void)TensorrtRtxExecutionProviderInfo::FromProviderOptions({{"nv_persistent_context_memory", "invalid"}}),
+        std::exception);
+}
+
+TEST(TensorRTRTXEpTest_Options, PersistentContextMemoryRepeatedRuns)
+{
+    const std::string model_name = "nv_execution_provider_persistent_context_memory.onnx";
+    model_builder::CreateBaseModel(model_name, "test", {1, 3, 2});
+    for (const auto* enabled : {"0", "1"})
+    {
+        SCOPED_TRACE(enabled);
+        Ort::SessionOptions so;
+        AppendTrtRtxEp(so, {{"nv_persistent_context_memory", enabled}});
+        Ort::Session session(*ort_env, toOrtString(model_name).c_str(), so);
+        auto io_binding = generate_io_binding(session);
+        Ort::RunOptions run_options;
+        for (int run = 0; run < 3; ++run)
+        {
+            session.Run(run_options, io_binding);
+        }
+    }
+}
+
 // The synchronous GPU allocator option (nv_use_sync_gpu_allocator) forces TensorRT RTX to allocate
 // through cudaMalloc/cudaFree (via the device BFC arena) instead of its default cudaMallocAsync
 // path. Verify a session with the option enabled is accepted, builds, and runs end-to-end.

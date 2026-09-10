@@ -130,6 +130,8 @@ TensorrtRtxExecutionProviderInfo TensorrtRtxExecutionProviderInfo::FromProviderO
                                       info.profiling_output_file)
             .AddAssignmentToReference(onnxruntime::tensorrt_rtx::provider_option_names::kUseSyncGpuAllocator,
                                       info.use_sync_gpu_allocator)
+            .AddAssignmentToReference(onnxruntime::tensorrt_rtx::provider_option_names::kPersistentContextMemory,
+                                      info.persistent_context_memory)
             .AddValueParser(onnxruntime::tensorrt_rtx::provider_option_names::kMultiRotaryCacheConcatOffset,
                             [&info](const std::string& value_str) -> OrtStatus*
                             {

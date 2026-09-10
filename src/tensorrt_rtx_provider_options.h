@@ -226,6 +226,17 @@ constexpr const char* kProfilingOutputFile = "nv_profiling_output_file";
 /// `0` — use default async allocator (`cudaMallocAsync`). `1` — use synchronous allocator (`cudaMalloc`).
 constexpr const char* kUseSyncGpuAllocator = "nv_use_sync_gpu_allocator";
 
+/// @brief Retain execution context device memory between runs in both normal and EPContext execution.
+/// Allocates the engine-wide memory requirement on first use, avoiding per-run allocations at the cost
+/// of retaining GPU memory until the session is destroyed, including for smaller dynamic shapes.
+/// @par Type
+/// Boolean (`0` or `1`)
+/// @par Default
+/// `0`
+/// @par Accepted values
+/// `0` — allocate memory per run. `1` — retain and reuse memory for each execution context.
+constexpr const char* kPersistentContextMemory = "nv_persistent_context_memory";
+
 /// @brief Token offset at which the EP switches from the short to the long rotary
 /// position embedding (RoPE) cache. Required for LongRoPE models such as Phi-4.
 /// Most users can leave this at the default of ``0``.

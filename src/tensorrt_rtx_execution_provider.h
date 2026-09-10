@@ -439,8 +439,9 @@ struct TensorrtRtxComputeState
     std::vector<AllocatorUniquePtr<void>> scratch_buffers;
     std::vector<TensorParams> input_tensors;
     std::vector<TensorParams> output_tensors;
-    bool is_first_run = true;              //!< Indicates if this is the first run of the engine
-    bool skip_io_binding_allowed = false;  //!< Indicates if input/output binding can be skipped
+    bool is_first_run = true;                           //!< Indicates if this is the first run of the engine
+    bool skip_io_binding_allowed = false;               //!< Indicates if input/output binding can be skipped
+    AllocatorUniquePtr<void> execution_context_memory;  //!< Optional device allocation retained between runs
 };
 
 //!
@@ -460,8 +461,9 @@ struct TensorrtRtxEpContextNodeComputeState
     std::vector<AllocatorUniquePtr<void>> scratch_buffers;
     std::vector<TensorParams> input_tensors;
     std::vector<TensorParams> output_tensors;
-    bool is_first_run = true;              //!< Indicates if this is the first run of the engine
-    bool skip_io_binding_allowed = false;  //!< Indicates if input/output binding can be skipped
+    bool is_first_run = true;                           //!< Indicates if this is the first run of the engine
+    bool skip_io_binding_allowed = false;               //!< Indicates if input/output binding can be skipped
+    AllocatorUniquePtr<void> execution_context_memory;  //!< Optional device allocation retained between runs
 };
 
 //!
@@ -750,6 +752,11 @@ public:
     bool IsSyncGpuAllocatorEnabled() const
     {
         return sync_gpu_allocator_ != nullptr;
+    }
+    //! \brief True when execution context device memory is retained between runs.
+    bool IsPersistentContextMemoryEnabled() const
+    {
+        return info_.persistent_context_memory;
     }
     bool IsGraphCaptureAllowed(CudaGraphAnnotation_t cuda_graph_annotation_id) const;
     bool IsGraphCaptureAllowedOnRun(CudaGraphAnnotation_t cuda_graph_annotation_id) const;
