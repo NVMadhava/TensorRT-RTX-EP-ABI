@@ -1072,30 +1072,20 @@ SubGraphCollection_t TensorrtRtxExecutionProvider::GetSupportedList(SubGraphColl
             }
             auto proto_idx_to_ort_idx = build_proto_to_ort_index(ort_node_id_to_index);
 
-            // Only query subgraph info when parsing succeeded.
-            // Calling getNbSubgraphs()/getSubgraphNodes() on a failed parser
-            // crashes — leave parser_nodes_list empty so the recursion correctly
-            // treats this group as fully unsupported.
-            if (is_model_supported)
+            auto append_parser_subgraphs = [&](nvonnxparser::IParser& parser, bool default_support)
             {
-                // TRT returns subgraph nodes as indices into the serialized model graph.
-                // Convert those to ORT node indices for recursive processing.
-                // Note: Calling getNbSubgraphs or getSubgraphNodes before calling supportsModelV2 results in
-                // undefined behavior.
-                auto num_subgraphs = trt_parser->getNbSubgraphs();
-                parser_nodes_list.reserve(num_subgraphs);
+                auto num_subgraphs = parser.getNbSubgraphs();
+                parser_nodes_list.reserve(parser_nodes_list.size() + num_subgraphs);
 
                 for (int64_t i = 0; i < num_subgraphs; ++i)
                 {
                     int64_t subgraph_len = 0;
-                    int64_t* subgraph_nodes = trt_parser->getSubgraphNodes(i, subgraph_len);
+                    int64_t* subgraph_nodes = parser.getSubgraphNodes(i, subgraph_len);
                     parser_nodes_list.emplace_back();
                     parser_nodes_list.back().first.reserve(subgraph_len);
                     std::unordered_set<size_t> seen_ort_node_indices;
                     for (int64_t j = 0; j < subgraph_len; ++j)
                     {
-                        // Lowering can expand one ORT node into several proto nodes. We only
-                        // keep parser nodes that still carry a valid original ORT node id.
                         size_t proto_node_idx = static_cast<size_t>(subgraph_nodes[j]);
                         if (proto_node_idx >= proto_idx_to_ort_idx.size() ||
                             !proto_idx_to_ort_idx[proto_node_idx].has_value())
@@ -1109,7 +1099,77 @@ SubGraphCollection_t TensorrtRtxExecutionProvider::GetSupportedList(SubGraphColl
                             parser_nodes_list.back().first.push_back(static_cast<int64_t>(ort_node_idx));
                         }
                     }
-                    parser_nodes_list.back().second = is_model_supported;
+                    parser_nodes_list.back().second = default_support ? true : parser.isSubgraphSupported(i);
+                }
+            };
+
+            if (is_model_supported)
+            {
+                append_parser_subgraphs(*trt_parser, true);
+            }
+            else
+            {
+                const bool candidate_has_control_flow =
+                    std::any_of(subgraph_node_views.begin(), subgraph_node_views.end(), [&](const auto& node)
+                                {
+                                    return control_flow_op_set_.find(node.GetOperatorType()) !=
+                                           control_flow_op_set_.end();
+                                });
+
+                // A failed parseModelProto parser cannot safely expose subgraph data. Re-run the documented
+                // support query on a fresh parser for the enclosing control-flow candidate so supported regions
+                // remain available around a genuinely unsupported control-flow node.
+                if (candidate_has_control_flow)
+                {
+                    ONNX_NAMESPACE::ModelProto support_model_proto = model_proto;
+                    std::unordered_map<std::string, const TensorrtUserWeights*> weight_by_name;
+                    weight_by_name.reserve(userWeights.size());
+                    for (const auto& weight : userWeights)
+                    {
+                        weight_by_name.emplace(weight.Name(), &weight);
+                    }
+
+                    auto inline_initializers = [&](auto&& self, ONNX_NAMESPACE::GraphProto* graph_proto) -> void
+                    {
+                        for (auto& initializer : *graph_proto->mutable_initializer())
+                        {
+                            auto weight_it = weight_by_name.find(initializer.name());
+                            if (weight_it == weight_by_name.end())
+                            {
+                                continue;
+                            }
+
+                            const auto* weight = weight_it->second;
+                            initializer.clear_external_data();
+                            initializer.clear_data_location();
+                            initializer.set_raw_data(reinterpret_cast<const char*>(weight->Data()), weight->Size());
+                        }
+
+                        for (auto& node : *graph_proto->mutable_node())
+                        {
+                            for (auto& attribute : *node.mutable_attribute())
+                            {
+                                if (attribute.has_g())
+                                {
+                                    self(self, attribute.mutable_g());
+                                }
+                                for (auto& nested_graph : *attribute.mutable_graphs())
+                                {
+                                    self(self, &nested_graph);
+                                }
+                            }
+                        }
+                    };
+                    inline_initializers(inline_initializers, support_model_proto.mutable_graph());
+
+                    std::string support_string_buf;
+                    support_model_proto.SerializeToString(&support_string_buf);
+                    auto support_network =
+                        std::unique_ptr<nvinfer1::INetworkDefinition>(trt_builder->createNetworkV2(network_flags));
+                    auto support_parser = tensorrt_ptr::unique_pointer<nvonnxparser::IParser>(
+                        nvonnxparser::createParser(*support_network, trt_logger));
+                    support_parser->supportsModelV2(support_string_buf.data(), support_string_buf.size(), model_path_);
+                    append_parser_subgraphs(*support_parser, false);
                 }
             }
 
@@ -1198,6 +1258,30 @@ SubGraphCollection_t TensorrtRtxExecutionProvider::GetSupportedList(SubGraphColl
                 }
             }
         }
+
+        // A failed support query can return the same unsupported candidate. Retrying an unchanged group cannot
+        // refine the partition and would otherwise repeat until max_partition_iterations.
+        parser_nodes_list.erase(
+            std::remove_if(parser_nodes_list.begin(), parser_nodes_list.end(),
+                           [&](const auto& parser_group)
+                           {
+                               if (parser_group.second || parser_group.first.size() != subgraph_node_views.size())
+                               {
+                                   return false;
+                               }
+
+                               std::unordered_set<int64_t> returned_nodes(parser_group.first.begin(),
+                                                                          parser_group.first.end());
+                               for (size_t node_index = 0; node_index < subgraph_node_views.size(); ++node_index)
+                               {
+                                   if (returned_nodes.find(static_cast<int64_t>(node_index)) == returned_nodes.end())
+                                   {
+                                       return false;
+                                   }
+                               }
+                               return true;
+                           }),
+            parser_nodes_list.end());
 
         // Recurse into the returned subgraphs to refine support boundaries.
         const int next_iteration = iterations + 1;
@@ -3433,40 +3517,12 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
         bool supported_node = true;
         std::string op_type = ort_node.GetOperatorType();
 
-        /* If current node is control flow op, we take different approach based on following four cases:
-         *
-         * (1) control flow op is supported by TRT, and its subgraphs are all supported by TRT. Assign this node to TRT.
-         * (2) control flow op is supported by TRT, but not all its subgraphs supported by TRT. Don't assign this node
-         * to TRT. (3) control flow op is not supported by TRT, but its subgraphs all supported by TRT. Don't assign
-         * this node to TRT. (4) control flow op is not supported by TRT, and not all its subgraphs supported by TRT.
-         * Don't assign this node to TRT.
-         *
-         * For cases 2, 3, 4, even though the control flow op is not assigned to TRT, any portion of its subgraphs that
-         * can run in TRT will be still fused and assigned to TRT EP.
-         */
+        // An isolated nested-graph capability failure is not conclusive for its enclosing control-flow node.
+        // Keep the node in the parent candidate so TensorRT RTX can validate it with the producer context for
+        // implicit captures. The parser remains the final support authority.
         if (ep->control_flow_op_set_.find(op_type) != ep->control_flow_op_set_.end())
         {
-            auto supported_control_flow_op = [&](Ort::ConstNode node) -> bool
-            {
-                auto sub_graphs = node.GetSubgraphs();
-                if (sub_graphs.size() != 0)
-                {
-                    for (const auto& attr_subgraph : sub_graphs)
-                    {
-                        if (attr_subgraph.sub_graph.GetNodes().size() == 0)
-                        {
-                            continue;
-                        }
-                        if (!ep->AllNodesAssignedToSpecificEP(attr_subgraph.sub_graph, ep->name_))
-                        {
-                            return false;
-                        }
-                        return true;
-                    }
-                }
-                return true;
-            };
-            supported_node = supported_control_flow_op(ort_node);
+            supported_node = true;
         }
 
         // Exclude any ops, if applicable
@@ -3557,6 +3613,13 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
                                                             message.c_str(), ORT_FILE, __LINE__, __FUNCTION__));
             supported_nodes_vector = consolidated_supported_nodes_vector;
         }
+    }
+
+    // Keep nested graphs unchanged until the owning control-flow node is validated in its parent scope. If the
+    // parent retry is rejected, this EP-only approach deliberately leaves the complete branch on CPU.
+    if (ep->IsSubGraphOfControlFlowOp(graph))
+    {
+        return nullptr;
     }
 
     // Handle the case where the graph is subgraph of control flow op.
