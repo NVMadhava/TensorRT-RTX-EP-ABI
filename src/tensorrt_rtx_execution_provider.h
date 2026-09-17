@@ -709,7 +709,8 @@ private:
 
     SubGraphCollection_t GetSupportedList(SubGraphCollection_t nodes_vector_input, int iterations,
                                           const int max_iterations, const OrtGraph* graph,
-                                          bool* early_termination) const;
+                                          bool* early_termination,
+                                          const std::unordered_set<size_t>& retryable_control_flow_node_ids = {}) const;
 
     bool DetectTensorRTGraphCycles(SubGraphCollection_t& supported_nodes_vector, const Ort::ConstGraph& graph,
                                    const HashValue& model_hash, bool remove_cycles = true) const;
