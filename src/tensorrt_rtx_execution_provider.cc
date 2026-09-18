@@ -843,9 +843,7 @@ static std::string GetDataTypeName(ONNXTensorElementDataType data_type)
 SubGraphCollection_t TensorrtRtxExecutionProvider::GetSupportedList(SubGraphCollection_t nodes_vector_input,
                                                                     int iterations, const int max_iterations,
                                                                     const OrtGraph* graph,
-                                                                    bool* early_termination,
-                                                                    const std::unordered_set<size_t>&
-                                                                        retryable_control_flow_node_ids) const
+                                                                    bool* early_termination) const
 {
     // Walk the input subgraphs and recursively refine TensorRT-supported regions.
     // High-level flow per group:
@@ -1077,8 +1075,7 @@ SubGraphCollection_t TensorrtRtxExecutionProvider::GetSupportedList(SubGraphColl
             // Only query subgraph info when parsing succeeded.
             // Calling getNbSubgraphs()/getSubgraphNodes() on a failed parser
             // crashes — leave parser_nodes_list empty so the recursion correctly
-            // treats this group as fully unsupported unless this is a failed
-            // full-context control-flow retry handled below.
+            // treats this group as fully unsupported.
             if (is_model_supported)
             {
                 // TRT returns subgraph nodes as indices into the serialized model graph.
@@ -1202,46 +1199,10 @@ SubGraphCollection_t TensorrtRtxExecutionProvider::GetSupportedList(SubGraphColl
             }
         }
 
-        if (!is_model_supported)
-        {
-            bool split_retryable_control_flow = false;
-            SubGraphCollection_t retry_groups;
-            for (size_t node_index = 0; node_index < subgraph_node_views.size(); ++node_index)
-            {
-                if (retryable_control_flow_node_ids.count(subgraph_node_views[node_index].GetId()) != 0)
-                {
-                    split_retryable_control_flow = true;
-                    continue;
-                }
-
-                if (retry_groups.empty() ||
-                    (node_index > 0 && retryable_control_flow_node_ids.count(
-                                           subgraph_node_views[node_index - 1].GetId()) != 0))
-                {
-                    retry_groups.emplace_back(std::vector<size_t>{}, false);
-                }
-                retry_groups.back().first.push_back(static_cast<int64_t>(node_index));
-            }
-
-            if (split_retryable_control_flow)
-            {
-                parser_nodes_list = std::move(retry_groups);
-                std::string message =
-                    "[NvTensorRTRTX EP] Full-context control-flow retry failed; retrying the surrounding graph "
-                    "without the retained control-flow node";
-                OrtStatus* log_status = ort_api.Logger_LogMessage(&logger_, OrtLoggingLevel::ORT_LOGGING_LEVEL_WARNING,
-                                                                  message.c_str(), ORT_FILE, __LINE__, __FUNCTION__);
-                if (log_status)
-                {
-                    ort_api.ReleaseStatus(log_status);
-                }
-            }
-        }
-
         // Recurse into the returned subgraphs to refine support boundaries.
         const int next_iteration = iterations + 1;
-        auto next_nodes_list = GetSupportedList(parser_nodes_list, next_iteration, max_iterations, subgraph_view,
-                                                early_termination, retryable_control_flow_node_ids);
+        auto next_nodes_list =
+            GetSupportedList(parser_nodes_list, next_iteration, max_iterations, subgraph_view, early_termination);
 
         // Remap indices from child graph scope back to the parent graph.
         // Root call (iterations == 0) uses group.first, which maps child indices to parent indices directly.
@@ -3455,32 +3416,7 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
     auto exclude_ops_set = get_exclude_ops_set(ep->op_types_to_exclude_);
 
     SubGraphCollection_t parser_nodes_vector, supported_nodes_vector;
-    std::unordered_set<size_t> retryable_control_flow_node_ids;
     bool new_subgraph = true;
-
-    auto graph_passes_coarse_checks = [&](auto&& self, Ort::ConstGraph candidate_graph) -> bool
-    {
-        for (const auto& candidate_node : candidate_graph.GetNodes())
-        {
-            const std::string candidate_op_type = candidate_node.GetOperatorType();
-            if (exclude_ops_set.count(candidate_op_type) != 0 || !CheckNodeDataTypes(candidate_node))
-            {
-                return false;
-            }
-
-            if (ep->control_flow_op_set_.count(candidate_op_type) != 0)
-            {
-                for (const auto& nested_subgraph : candidate_node.GetSubgraphs())
-                {
-                    if (!self(self, nested_subgraph.sub_graph))
-                    {
-                        return false;
-                    }
-                }
-            }
-        }
-        return true;
-    };
 
     // for regular onnx nodes, get supported node list from TensorRT parser
     std::vector<size_t> nodes_vector(number_of_ort_nodes);
@@ -3510,36 +3446,27 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
          */
         if (ep->control_flow_op_set_.find(op_type) != ep->control_flow_op_set_.end())
         {
-            bool all_subgraphs_assigned_to_trt = true;
-            bool all_subgraphs_retry_eligible = true;
-            bool has_unassigned_coarse_eligible_subgraph = false;
-
-            for (const auto& attr_subgraph : ort_node.GetSubgraphs())
+            auto supported_control_flow_op = [&](Ort::ConstNode node) -> bool
             {
-                if (attr_subgraph.sub_graph.GetNodes().empty())
+                auto sub_graphs = node.GetSubgraphs();
+                if (sub_graphs.size() != 0)
                 {
-                    continue;
+                    for (const auto& attr_subgraph : sub_graphs)
+                    {
+                        if (attr_subgraph.sub_graph.GetNodes().size() == 0)
+                        {
+                            continue;
+                        }
+                        if (!ep->AllNodesAssignedToSpecificEP(attr_subgraph.sub_graph, ep->name_))
+                        {
+                            return false;
+                        }
+                        return true;
+                    }
                 }
-
-                const bool assigned_to_trt =
-                    ep->AllNodesAssignedToSpecificEP(attr_subgraph.sub_graph, ep->name_);
-                const bool unassigned_and_coarse_eligible =
-                    ep->AllNodesAssignedToSpecificEP(attr_subgraph.sub_graph, "") &&
-                    graph_passes_coarse_checks(graph_passes_coarse_checks, attr_subgraph.sub_graph);
-                all_subgraphs_assigned_to_trt &= assigned_to_trt;
-                all_subgraphs_retry_eligible &= assigned_to_trt || unassigned_and_coarse_eligible;
-                has_unassigned_coarse_eligible_subgraph |= unassigned_and_coarse_eligible;
-            }
-
-            supported_node = all_subgraphs_assigned_to_trt || all_subgraphs_retry_eligible;
-            if (!all_subgraphs_assigned_to_trt && all_subgraphs_retry_eligible &&
-                has_unassigned_coarse_eligible_subgraph)
-            {
-                // The isolated branches contained no coarse-check rejection, but the parser could not claim them.
-                // Keep the owning control-flow node in this parent candidate once so TRT can see the producer
-                // context of implicit captures. It is claimed only if the normal parser accepts this candidate.
-                retryable_control_flow_node_ids.insert(ort_node.GetId());
-            }
+                return true;
+            };
+            supported_node = supported_control_flow_op(ort_node);
         }
 
         // Exclude any ops, if applicable
@@ -3578,8 +3505,8 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
     }
 
     bool early_termination = false;
-    supported_nodes_vector = ep->GetSupportedList(parser_nodes_vector, 0, ep->max_partition_iterations_, graph,
-                                                  &early_termination, retryable_control_flow_node_ids);
+    supported_nodes_vector =
+        ep->GetSupportedList(parser_nodes_vector, 0, ep->max_partition_iterations_, graph, &early_termination);
 
     if (early_termination)
     {
