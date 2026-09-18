@@ -3415,6 +3415,30 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
 
     auto exclude_ops_set = get_exclude_ops_set(ep->op_types_to_exclude_);
 
+    auto graph_passes_coarse_checks = [&](auto&& self, Ort::ConstGraph candidate_graph) -> bool
+    {
+        for (const auto& candidate_node : candidate_graph.GetNodes())
+        {
+            const std::string candidate_op_type = candidate_node.GetOperatorType();
+            if (exclude_ops_set.count(candidate_op_type) != 0 || !CheckNodeDataTypes(candidate_node))
+            {
+                return false;
+            }
+
+            if (ep->control_flow_op_set_.count(candidate_op_type) != 0)
+            {
+                for (const auto& nested_subgraph : candidate_node.GetSubgraphs())
+                {
+                    if (!self(self, nested_subgraph.sub_graph))
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    };
+
     SubGraphCollection_t parser_nodes_vector, supported_nodes_vector;
     bool new_subgraph = true;
 
@@ -3446,27 +3470,26 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
          */
         if (ep->control_flow_op_set_.find(op_type) != ep->control_flow_op_set_.end())
         {
-            auto supported_control_flow_op = [&](Ort::ConstNode node) -> bool
+            bool all_subgraphs_assigned_to_trt = true;
+            bool all_subgraphs_unassigned_and_coarse_eligible = true;
+
+            for (const auto& attr_subgraph : ort_node.GetSubgraphs())
             {
-                auto sub_graphs = node.GetSubgraphs();
-                if (sub_graphs.size() != 0)
+                if (attr_subgraph.sub_graph.GetNodes().empty())
                 {
-                    for (const auto& attr_subgraph : sub_graphs)
-                    {
-                        if (attr_subgraph.sub_graph.GetNodes().size() == 0)
-                        {
-                            continue;
-                        }
-                        if (!ep->AllNodesAssignedToSpecificEP(attr_subgraph.sub_graph, ep->name_))
-                        {
-                            return false;
-                        }
-                        return true;
-                    }
+                    continue;
                 }
-                return true;
-            };
-            supported_node = supported_control_flow_op(ort_node);
+
+                all_subgraphs_assigned_to_trt &=
+                    ep->AllNodesAssignedToSpecificEP(attr_subgraph.sub_graph, ep->name_);
+                all_subgraphs_unassigned_and_coarse_eligible &=
+                    ep->AllNodesAssignedToSpecificEP(attr_subgraph.sub_graph, "") &&
+                    graph_passes_coarse_checks(graph_passes_coarse_checks, attr_subgraph.sub_graph);
+            }
+
+            // A completely unassigned control-flow node whose branches pass the inexpensive checks gets one
+            // parser attempt in its parent graph, where implicit captures have their producer context.
+            supported_node = all_subgraphs_assigned_to_trt || all_subgraphs_unassigned_and_coarse_eligible;
         }
 
         // Exclude any ops, if applicable
@@ -3648,6 +3671,15 @@ OrtStatus* ORT_API_CALL TensorrtRtxExecutionProvider::GetCapabilityImpl(
 
             return nullptr;
         }
+    }
+
+    // A fully supported branch whose sibling branches are also fully supported returns from the original path above.
+    // Otherwise, preserve coarse-eligible branches so the intact control-flow node can be parsed with parent context.
+    // A coarse-rejected branch continues through the original fallback logic below.
+    if (ep->IsSubGraphOfControlFlowOp(graph) &&
+        graph_passes_coarse_checks(graph_passes_coarse_checks, ort_graph))
+    {
+        return nullptr;
     }
 
     int number_of_trt_nodes = 0;
